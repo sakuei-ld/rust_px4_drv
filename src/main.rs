@@ -1,12 +1,14 @@
 mod itedtv_bus;
 mod it930x;
 mod rt710;
+mod tc90522;
 
 use rusb::{Context, DeviceHandle, UsbContext};
 
 use itedtv_bus::UsbBusRusb;
 use it930x::IT930x;
 use rt710::RT710;
+use tc90522::TC90522;
 
 fn main()
 {
@@ -64,7 +66,7 @@ fn main()
     let bus = UsbBusRusb::new(handle);
     let it930x = IT930x::new(bus);
 
-    if let Err(e) = it930x.load_firmware("firmware.bin")
+    if let Err(e) = it930x.load_firmware("it930x-firmware.bin")
     {
         println!("Failed to load firmware.: {}", e);
         return;
@@ -76,7 +78,8 @@ fn main()
         return;
     }
 
-    let mut rt710 = RT710::new(&it930x, 2, 0x79);
+    // bus と addr が正しいのか分からない
+    let mut rt710 = RT710::new(&it930x, 2, 0x7a);
     if let Err(e) = rt710.init()
     {
         println!("Failed to initialize RT710.: {}", e);

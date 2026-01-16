@@ -1,6 +1,22 @@
 // コントロールメッセージ層
 // IT930xデバイスとやりとりする独自バイナリプロトコルの実装層
 
+// これに関しては、いろんなところで使うので、実際はここじゃない方が良いかもしれない。
+// 下記2つで i2c_comm.h 17 〜 26 の移植
+#[derive(Clone, Copy)]
+pub enum I2CRequestType
+{
+    Read,
+    Write,
+}
+
+pub struct I2CCommRequest<'a>
+{
+    pub addr: u8,
+    pub data: &'a mut [u8],
+    pub req: I2CRequestType,
+}
+
 use crate::itedtv_bus::{BusError, BusOps};
 
 // エラー型
@@ -335,9 +351,10 @@ impl<B: BusOps> IT930x<B>
             return Ok(());
         }
 
+        println!("[debug] passed read_firmware_version()");
+
         // 2. I2Cスピード設定
-        let conf = [0u8]; // あとで変える必要がある。 // config.i2c_spped が必要
-        self.write_regs(0xf103, &conf)?;
+        self.write_regs(0xf103, &[self.config.i2c_speed])?;
 
         // 3. firmware file 読み込み
         let mut fw_file = File::open(path)?;
@@ -393,7 +410,7 @@ impl<B: BusOps> IT930x<B>
             return Err(CtrlMsgError::Bus(rusb::Error::Other.into()));
         }
 
-        println!("Firmware is already loaded. version: {}.{}.{}.{}", (fw_version >> 24) & 0xff, (fw_version >> 24) & 0xff, (fw_version >> 24) & 0xff, fw_version & 0xff);
+        println!("Firmware is loaded. version: {}.{}.{}.{}", (fw_version >> 24) & 0xff, (fw_version >> 24) & 0xff, (fw_version >> 24) & 0xff, fw_version & 0xff);
         return Ok(());
     }
 
@@ -421,22 +438,6 @@ impl<B: BusOps> IT930x<B>
         Ok(())
     }
 
-}
-
-
-// 下記2つで i2c_comm.h 17 〜 26 の移植
-#[derive(Clone, Copy)]
-pub enum I2CRequestType
-{
-    Read,
-    Write,
-}
-
-pub struct I2CCommRequest<'a>
-{
-    pub addr: u8,
-    pub data: &'a mut [u8],
-    pub req: I2CRequestType,
 }
 
 impl<B: BusOps> IT930x<B>

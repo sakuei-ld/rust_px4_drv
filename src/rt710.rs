@@ -29,27 +29,33 @@ pub struct RT710<'a, B:BusOps>
 
 impl<'a, B: BusOps> RT710<'a, B>
 {
+    const NUM_REGS: u8 = 0x10;
     pub fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError>
     {
-        let mut reg_buf = [reg];
+        let mut write_buf = [0];
+        let mut read_buf = vec![0u8; reg as usize + buf.len()];
 
         let mut reqs = 
         [
             I2CCommRequest
             {
                 addr: self.i2c_addr,
-                data: &mut reg_buf,
+                data: &mut write_buf,
                 req: I2CRequestType::Write,
             },
             I2CCommRequest
             {
                 addr: self.i2c_addr,
-                data: buf,
+                data: &mut read_buf,
                 req: I2CRequestType::Read,
             }
         ];
 
         self.it930x.i2c_master_request(self.i2c_bus, &mut reqs)?;
+
+        // ここで buf へ値を出す
+        // 逆イテレータで reg のサイズ前まで取りつつ、reverse_bit()
+
         Ok(())
     }
 
@@ -72,7 +78,7 @@ impl<'a, B: BusOps> RT710<'a, B>
 
     pub fn init(&mut self) -> Result<(), CtrlMsgError>
     {
-        let mut tmp = [0u8, 1];
+        let mut tmp = [0u8; 1];
         {
             let _lock = self.priv_.lock.lock().unwrap();
 

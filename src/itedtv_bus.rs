@@ -43,7 +43,8 @@ pub trait BusOps
 pub struct UsbBusRusb
 {
     handle: Mutex<DeviceHandle<Context>>,
-    ctrl_ep: u8,
+    ctrl_tx_ep: u8,
+    ctrl_rx_ep: u8,
     stream_ep: u8,
     ctrl_timeout: Duration,
 }
@@ -55,7 +56,8 @@ impl UsbBusRusb
         Self 
         { 
             handle: Mutex::new(handle), 
-            ctrl_ep: 0x02, 
+            ctrl_tx_ep: 0x02,
+            ctrl_rx_ep: 0x81, 
             stream_ep: 0x84, 
             ctrl_timeout: Duration::from_millis(3000), // px4_usb_params.c px4_usb_params.ctrl_timeout から。
         }
@@ -69,7 +71,7 @@ impl BusOps for UsbBusRusb
     {
         let guarded_handle = self.handle.lock().unwrap();
         //self.handle.write_bulk(self.ctrl_ep, buf, self.ctrl_timeout,)?;
-        guarded_handle.write_bulk(self.ctrl_ep, buf, self.ctrl_timeout,)?;
+        guarded_handle.write_bulk(self.ctrl_tx_ep, buf, self.ctrl_timeout,)?;
         Ok(())    
     }
 
@@ -78,7 +80,7 @@ impl BusOps for UsbBusRusb
     {
         let guarded_handle = self.handle.lock().unwrap();
         //let read_len = self.handle.read_bulk(self.ctrl_ep, buf, self.ctrl_timeout)?;
-        let read_len = guarded_handle.read_bulk(self.ctrl_ep, buf, self.ctrl_timeout)?;
+        let read_len = guarded_handle.read_bulk(self.ctrl_rx_ep, buf, self.ctrl_timeout)?;
 
         if read_len != buf.len()
         {
