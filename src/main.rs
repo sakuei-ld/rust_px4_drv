@@ -1,18 +1,26 @@
 mod itedtv_bus;
 mod it930x;
 mod rt710;
+mod r850;
 mod tc90522;
+mod px4_device;
 
-use rusb::{Context, DeviceHandle, UsbContext};
+use rusb::{Context, UsbContext};
 
 use itedtv_bus::UsbBusRusb;
 use it930x::IT930x;
 use rt710::RT710;
+use r850::R850;
 use tc90522::TC90522;
+
+use px4_device::{System, Px4Chrdev, Px4Device};
+
+use crate::px4_device::Tuner;
 
 fn main()
 {
-    let context = match rusb::Context::new()
+    // まず、USB関連の準備
+    let context = match Context::new()
     {
         Ok(c) => c,
         Err(e) =>
@@ -22,6 +30,7 @@ fn main()
         }
     };
 
+    // USBデバイスの検索
     const PX4_VID: u16 = 0x0511;
     const PX4_PID: u16 = 0x083f;
 
@@ -48,6 +57,7 @@ fn main()
         }
     };
 
+    // USBデバイスを開く
     let handle = match device.open()
     {
         Ok(h) => h,
@@ -58,11 +68,13 @@ fn main()
         }
     };
 
+    // USBデバイスを占有する
     if let Err(e) = handle.claim_interface(0)
     {
         println!("Failed to claim interface 0: {}", e);
     }
 
+    // 各種、デバイス操作用の準備
     let bus = UsbBusRusb::new(handle);
     let it930x = IT930x::new(bus);
 
@@ -78,14 +90,62 @@ fn main()
         return;
     }
 
-    // px4_device.c 1128 行目に chrdev4->tc90522.i2c = &it930x->i2c_master[1]; とあり
-    // it930x.c の 571 行目で、priv->i2c[i].bus = i + 1; で、
-    // it930x.c の 575 行目で、it930x->i2c_master[i].priv = &priv->i2c[i] とあるので、
-    // bus 番号は 2 で固定。
-    // -> px4 device の場合の話っぽい。
-    //  -> pxmlt device の場合は、&it930x->i2c_master[input->i2c_bus - 1]; みたいになってる。
-    //  -> s1ur や m1ur は [2] なので bus 番号は 3 らしい。
-    // あと、CHRDEV ごとにアドレスが違くて、0x10〜0x13。
+    // チューナーデバイスとしての準備
+    // SYSTEM, addr, port_number, sync_byte の順にデータを保持しておく？
+    // これは、W3U4 の場合だけ
+    // S1UR とか Q3U4 のときは知らないが、Q3U4 は多分、これで良い。(これの外側で2つ持つイメージだと思う)
+    let chrdev_configs = 
+    [
+        (System::ISDB_S, 0x11),
+        (System::ISDB_S, 0x13),
+        (System::ISDB_T, 0x10),
+        (System::ISDB_T, 0x12),
+    ];
+
+    let mut chrdevs = Vec::new();
+    for (i, (system, addr)) in chrdev_configs.iter().enumerate()
+    {
+        // px4_device.c 1128 行目に chrdev4->tc90522.i2c = &it930x->i2c_master[1]; とあり
+        // it930x.c の 571 行目で、priv->i2c[i].bus = i + 1; で、
+        // it930x.c の 575 行目で、it930x->i2c_master[i].priv = &priv->i2c[i] とあるので、
+        // bus 番号は 2 で固定。
+        // -> px4 device の場合の話っぽい。
+        //  -> pxmlt device の場合は、&it930x->i2c_master[input->i2c_bus - 1]; みたいになってる。
+        //  -> s1ur や m1ur は [2] なので bus 番号は 3 らしい。
+        // あと、CHRDEV ごとにアドレスが違くて、0x10〜0x13。
+        let tc90522 = TC90522::new(&it930x, 2, *addr);
+        
+        let tuner = match system
+        {
+            System::ISDB_S => Tuner::RT710(RT710::new(&tc90522, 0x7a)),
+            System::ISDB_T => Tuner::R850(R850::new(&tc90522, 0x7c)),
+        };
+
+        chrdevs.push(
+            Px4Chrdev
+            {
+                system: *system,
+                port_number: i as u8 + 1,
+                slave_number: i as u8,
+                sync_byte: ((i as u8 + 1) << 4) | 0x07,
+                tc90522: tc90522,
+                tuner: tuner,
+            }
+        );
+    }
+
+    for chrdev in &mut chrdevs
+    {
+        //chrdev.tc90522.init();
+
+        match &mut chrdev.tuner
+        {
+            Tuner::RT710(t) => t.init(),
+            Tuner::R850(t) => t.init(),
+        }
+    }
+
+    
     let tc90522 = TC90522::new(&it930x, 2, 0x1f);
 
     // addr は、要確認。

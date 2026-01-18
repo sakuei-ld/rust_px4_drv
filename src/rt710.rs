@@ -73,7 +73,7 @@ impl<'a, B: BusOps> RT710<'a, B>
         // 逆イテレータで reg のサイズ前まで取りつつ、reverse_bit()
         for i in 0..buf.len()
         {
-            buf[i] = Self::reverse_bit(read_buf[reg as usize + i])
+            buf[i] = Self::reverse_bit(read_buf[reg as usize + i]);
         }
 
         Ok(())
