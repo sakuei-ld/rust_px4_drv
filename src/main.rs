@@ -78,8 +78,19 @@ fn main()
         return;
     }
 
-    // bus と addr が正しいのか分からない
-    let mut rt710 = RT710::new(&it930x, 2, 0x7a);
+    // px4_device.c 1128 行目に chrdev4->tc90522.i2c = &it930x->i2c_master[1]; とあり
+    // it930x.c の 571 行目で、priv->i2c[i].bus = i + 1; で、
+    // it930x.c の 575 行目で、it930x->i2c_master[i].priv = &priv->i2c[i] とあるので、
+    // bus 番号は 2 で固定。
+    // -> px4 device の場合の話っぽい。
+    //  -> pxmlt device の場合は、&it930x->i2c_master[input->i2c_bus - 1]; みたいになってる。
+    //  -> s1ur や m1ur は [2] なので bus 番号は 3 らしい。
+    // あと、CHRDEV ごとにアドレスが違くて、0x10〜0x13。
+    let tc90522 = TC90522::new(&it930x, 2, 0x1f);
+
+    // addr は、要確認。
+    // 4つあるうちの2つを選ぶ、感じのはず。
+    let mut rt710 = RT710::new(&tc90522, 0x7a);
     if let Err(e) = rt710.init()
     {
         println!("Failed to initialize RT710.: {}", e);

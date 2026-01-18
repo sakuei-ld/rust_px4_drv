@@ -2,8 +2,9 @@
 
 use std::sync::Mutex;
 
+use crate::it930x::{I2CCommRequest, I2CRequestType, CtrlMsgError};
 use crate::itedtv_bus::BusOps;
-use crate::it930x::{IT930x, CtrlMsgError, I2CCommRequest, I2CRequestType};
+use crate::tc90522::{self, TC90522};
 
 #[derive(Debug, Clone, Copy)]
 pub enum RT710ChipType
@@ -20,10 +21,10 @@ pub struct  RT710Priv
     chip: RT710ChipType,
 }
 
-pub struct RT710<'a, B:BusOps>
+pub struct RT710<'a, B: BusOps>
 {
-    it930x: &'a IT930x<B>,
-    pub i2c_bus: u8,
+    tc90522: &'a TC90522<'a, B>,
+    //pub i2c_bus: u8,
     pub i2c_addr: u8,
     priv_: RT710Priv,
 }
@@ -66,7 +67,7 @@ impl<'a, B: BusOps> RT710<'a, B>
             }
         ];
 
-        self.it930x.i2c_master_request(self.i2c_bus, &mut reqs)?;
+        self.tc90522.i2c_master_request(&mut reqs)?;
 
         // ここで buf へ値を出す
         // 逆イテレータで reg のサイズ前まで取りつつ、reverse_bit()
@@ -85,7 +86,9 @@ impl<'a, B: BusOps> RT710<'a, B>
             return Err(CtrlMsgError::InvalidLength);
         }
 
-        let mut wbuf = buf;
+        let mut wbuf = Vec::with_capacity(1 + buf.len());
+        wbuf.push(reg);
+        wbuf.extend_from_slice(buf);
 
         let mut reqs = 
         [
@@ -97,15 +100,14 @@ impl<'a, B: BusOps> RT710<'a, B>
             }
         ];
 
-        self.it930x.i2c_master_request(self.i2c_bus, &mut reqs)
+        self.tc90522.i2c_master_request(&mut reqs)
     }
 
-    pub fn new(it930x: &'a IT930x<B>, bus: u8, addr: u8) -> Self
+    pub fn new(tc90522: &'a TC90522<B>, addr: u8) -> Self
     {
         Self 
         { 
-            it930x, 
-            i2c_bus: bus, 
+            tc90522, 
             i2c_addr: addr, 
             priv_: RT710Priv
             {
