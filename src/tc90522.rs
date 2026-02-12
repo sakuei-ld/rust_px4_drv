@@ -94,60 +94,93 @@ impl<'a, B: BusOps> TC90522<'a, B>
     pub fn i2c_master_request(&self, requests: &mut [I2CCommRequest]) -> Result<(), CtrlMsgError>
     {
         let _lock = self.i2c_lock.lock().unwrap();
-        let mut master_reqs: Vec<I2CCommRequest> = Vec::new();
 
-        // for文内での借用における、データ保持箇所
-        let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); requests.len()];
+        //*
+        // Cの特別扱い分岐の再現
+    if requests.len() == 2
+        && requests[0].req == I2CRequestType::Write
+        && requests[1].req == I2CRequestType::Read
+    {
+        // 1) [0xFE, addr<<1, payload...]
+        let mut b0 = Vec::with_capacity(2 + requests[0].data.len());
+        b0.push(0xFE);
+        b0.push(requests[0].addr << 1);
+        b0.extend_from_slice(requests[0].data);
 
-        for (req, buf) in requests.iter_mut().zip(buffers.iter_mut())
+        // 2) [0xFE, addr<<1|1]
+        let mut b1 = [0xFE, (requests[1].addr << 1) | 0x01];
+
+        // 3本を「1回の呼び出し」で投げる
+        let mut master = [
+            I2CCommRequest {
+                addr: self.i2c_addr,
+                data: b0.as_mut_slice(),
+                req: I2CRequestType::Write,
+            },
+            I2CCommRequest {
+                addr: self.i2c_addr,
+                data: &mut b1,
+                req: I2CRequestType::Write,
+            },
+            I2CCommRequest {
+                addr: self.i2c_addr,
+                data: requests[1].data,
+                req: I2CRequestType::Read,
+            },
+        ];
+
+        return self.it930x.i2c_master_request(self.bus, &mut master);
+    }
+    //*/
+
+        for req in requests.iter_mut()
         {
             match req.req
             {
                 I2CRequestType::Read =>
                 {
-                    buf.clear();
-                    buf.push(0xFE);
-                    buf.push(req.addr << 1);
-
-                    master_reqs.push(
-                        I2CCommRequest 
-                        { 
-                            addr: self.i2c_addr, 
-                            data: buf.as_mut_slice(), 
-                            req: I2CRequestType::Write, 
+                    let mut write_buf = [0xFE, (req.addr << 1) | 0x01];
+                    let mut master = 
+                    [
+                        I2CCommRequest{
+                            addr: self.i2c_addr,
+                            data: &mut write_buf,
+                            req: I2CRequestType::Write,
+                        },
+                        I2CCommRequest{
+                            addr: self.i2c_addr,
+                            data: req.data,
+                            req: I2CRequestType::Read,
                         }
-                    );
+                    ];
 
-                    master_reqs.push(
-                        I2CCommRequest 
-                        { 
-                            addr: self.i2c_addr, 
-                            data: req.data, 
-                            req: I2CRequestType::Read, 
-                        }
-                    )
+                    self.it930x.i2c_master_request(self.bus, &mut master)?;
                 }
-
+                
                 I2CRequestType::Write =>
                 {
-                    buf.clear();
-                    buf.push(0xFE); // tc90522.c 327行目
+                    if req.data.is_empty() || req.data.len() > 253
+                    {
+                        return Err(CtrlMsgError::InvalidLength);
+                    }
+
+                    let mut buf = Vec::with_capacity(2 + req.data.len());
+                    buf.push(0xFE);
                     buf.push(req.addr << 1);
                     buf.extend_from_slice(req.data);
 
-                    master_reqs.push(
-                        I2CCommRequest 
-                        { 
-                            addr: self.i2c_addr, 
+                    let mut master = [
+                        I2CCommRequest{
+                            addr: self.i2c_addr,
                             data: buf.as_mut_slice(),
                             req: I2CRequestType::Write,
                         }
-                    );
+                    ];
+
+                    self.it930x.i2c_master_request(self.bus, &mut master)?;
                 }
             }
         }
-
-        self.it930x.i2c_master_request(self.bus, &mut master_reqs)
+        Ok(())
     }
-
 }

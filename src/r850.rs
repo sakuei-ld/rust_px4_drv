@@ -1,8 +1,10 @@
 use std::sync::Mutex;
 
-use crate::it930x::{I2CCommRequest, I2CRequestType, CtrlMsgError};
+use crate::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
 use crate::itedtv_bus::BusOps;
 use crate::tc90522::TC90522;
+
+use crate::px4_device::TunerError;
 
 const R850_NUM_REGS: usize = 0x30;
 
@@ -15,17 +17,6 @@ pub const INIT_REGS: [u8; R850_NUM_REGS] = [
     0x21, 0xf1, 0x4c, 0x5f, 0xc4, 0x20, 0xa9, 0x6c,
     0x53, 0xab, 0x5b, 0x46, 0xb3, 0x93, 0x6e, 0x41,
 ];
-
-// エラー関連
-use thiserror::Error;
-#[derive(Debug, Error)]
-pub enum TunerError
-{
-    #[error("control message error: {0}")]
-    CtrlMsg(#[from] CtrlMsgError),  // CtrlMsgError をラップ
-    #[error("R850 chip not detected.")]
-    ChipNotDetected,
-}
 
 // 設定
 #[derive(Debug, Clone, Copy)]
@@ -103,7 +94,7 @@ pub struct R850ImrCal {
 
 pub struct R850<'a, B: BusOps>
 {
-    tc90522: &'a TC90522<'a, B>,
+    tc90522: TC90522<'a, B>,
 
     // 設定パラメータ
     pub xtal: u32,
@@ -259,12 +250,13 @@ impl<'a, B: BusOps> R850<'a, B>
         Ok(())
     }
 
-    pub fn new(tc90522: &'a TC90522<B>, addr: u8) -> Self
+    pub fn new(it930x: &'a IT930x<B>, tc90522_bus: u8, tc90522_addr: u8) -> Self
     {
         Self 
         { 
-            tc90522, 
-            i2c_addr: addr, 
+            tc90522: TC90522::new(it930x, tc90522_bus, tc90522_addr), 
+            //i2c_addr: 0x7c, 
+            i2c_addr: 0x3e,
 
             xtal: 0,
             loop_through: false,

@@ -6,6 +6,7 @@
 use std::time::Duration;
 use rusb::{Context, DeviceHandle};
 use std::sync::Mutex;
+use std::thread;
 
 #[derive(Debug)]
 pub enum BusError 
@@ -30,13 +31,16 @@ pub trait BusOps
     // Control転送(Out)
     fn ctrl_tx(&self, buf: &[u8]) -> Result<(), BusError>;
     // Control転送(In)
-    fn ctrl_rx(&self, buf: &mut [u8]) -> Result<(), BusError>;
+    fn ctrl_rx(&self, buf: &mut [u8]) -> Result<usize, BusError>;
     // ストリーム受信(Bulk In)
     fn stream_rx(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, BusError>;
     // ストリーミング開始
     fn start_streaming(&self) -> Result<(), BusError>;
     // ストリーミング停止
     fn stop_streaming(&self) -> Result<(), BusError>;
+
+    // max_bulk_size の取得
+    fn max_bulk_size(&self) -> u32;
 }
 
 // メモ: C の struct itedtv_bus に該当 するらしい
@@ -47,20 +51,33 @@ pub struct UsbBusRusb
     ctrl_rx_ep: u8,
     stream_ep: u8,
     ctrl_timeout: Duration,
+    max_bulk_size: u32,
+    //streaming: // ... あとで足す
 }
 
 impl UsbBusRusb
 {
-    pub fn new(handle: DeviceHandle<Context>) -> Self
+    pub fn new(handle: DeviceHandle<Context>) -> Result<Self, BusError>
     {
-        Self 
+        // ここだとダメ
+        // main.rs で Device<Context> としている箇所じゃないといけないので、後で調整
+        //let usb_version = handle.device_descriptor().usb_version();
+        //if usb_version < 0x0110 
+        //{
+        //    return Err(BusError::Other(format!("USB device requires at least USB 1.1")));
+        //}
+
+        //let max_bulk_size = if usb_version == 0x0110 { 64 } else { 512 };
+
+        Ok(Self 
         { 
-            handle: Mutex::new(handle), 
+            handle: Mutex::new(handle), // ここを Arc<Mutex<DeviceHandle<rusb::Context>>> として、参照カウントに対応するようにした方がいいと言われた
             ctrl_tx_ep: 0x02,
             ctrl_rx_ep: 0x81, 
             stream_ep: 0x84, 
             ctrl_timeout: Duration::from_millis(3000), // px4_usb_params.c px4_usb_params.ctrl_timeout から。
-        }
+            max_bulk_size: 512, //max_bulk_size,
+        })
     }
 }
 
@@ -72,22 +89,26 @@ impl BusOps for UsbBusRusb
         let guarded_handle = self.handle.lock().unwrap();
         //self.handle.write_bulk(self.ctrl_ep, buf, self.ctrl_timeout,)?;
         guarded_handle.write_bulk(self.ctrl_tx_ep, buf, self.ctrl_timeout,)?;
+
+        thread::sleep(Duration::from_millis(1));
         Ok(())    
     }
 
     // itedtv_bus.c の 72〜97 と思われる。
-    fn ctrl_rx(&self, buf: &mut [u8]) -> Result<(), BusError>
+    fn ctrl_rx(&self, buf: &mut [u8]) -> Result<usize, BusError>
     {
         let guarded_handle = self.handle.lock().unwrap();
         //let read_len = self.handle.read_bulk(self.ctrl_ep, buf, self.ctrl_timeout)?;
         let read_len = guarded_handle.read_bulk(self.ctrl_rx_ep, buf, self.ctrl_timeout)?;
 
-        if read_len != buf.len()
-        {
-            return Err(BusError::Other(format!("short read: {} != {}", read_len, buf.len())));
-        }
+        // あとで消す
+        //if read_len != buf.len()
+        //{
+        //    return Err(BusError::Other(format!("short read: {} != {}", read_len, buf.len())));
+        //}
 
-        Ok(())
+        thread::sleep(Duration::from_millis(1));
+        Ok(read_len)
     }
 
     // itedtv_bus.c の 99〜118 と思われる。
@@ -113,6 +134,11 @@ impl BusOps for UsbBusRusb
     {
         // C では、フラグ管理らしいので、それらしきことをすれば良い？
         Ok(())
+    }
+
+    fn max_bulk_size(&self) -> u32 
+    {
+        self.max_bulk_size
     }
 }
 

@@ -9,13 +9,7 @@ use rusb::{Context, UsbContext};
 
 use itedtv_bus::UsbBusRusb;
 use it930x::IT930x;
-use rt710::RT710;
-use r850::R850;
-use tc90522::TC90522;
-
-use px4_device::{System, Px4Chrdev, Px4Device};
-
-use crate::px4_device::Tuner;
+use px4_device::Px4Device;
 
 fn main()
 {
@@ -75,8 +69,24 @@ fn main()
     }
 
     // 各種、デバイス操作用の準備
-    let bus = UsbBusRusb::new(handle);
+    let bus = match UsbBusRusb::new(handle)
+    {
+        Ok(b) => b,
+        Err(e) =>
+        {
+            println!("Failed to UsbBusRusb::new().");
+            return;
+        }
+    };
+
     let it930x = IT930x::new(bus);
+
+    // 疎通チェック
+    if let Err(e) = it930x.raise()
+    {
+        println!("Failed to raise.: {}", e);
+        return;
+    }
 
     if let Err(e) = it930x.load_firmware("it930x-firmware.bin")
     {
@@ -84,79 +94,29 @@ fn main()
         return;
     }
 
-    if let Err(e) = it930x.config_i2c()
+    if let Err(e) = it930x.init_warm()
     {
-        println!("Failed to configure I2C.: {}", e);
+        println!("Failed to initial warm.: {}", e);
         return;
     }
 
-    // チューナーデバイスとしての準備
-    // SYSTEM, addr, port_number, sync_byte の順にデータを保持しておく？
-    // これは、W3U4 の場合だけ
-    // S1UR とか Q3U4 のときは知らないが、Q3U4 は多分、これで良い。(これの外側で2つ持つイメージだと思う)
-    let chrdev_configs = 
-    [
-        (System::ISDB_S, 0x11),
-        (System::ISDB_S, 0x13),
-        (System::ISDB_T, 0x10),
-        (System::ISDB_T, 0x12),
-    ];
+    it930x.set_gpio_mode(7, it930x::GpioMode::Out, true).expect("gpio7 mode failed");
+    it930x.set_gpio_mode(2, it930x::GpioMode::Out, true).expect("gpio2 mode failed");
 
-    let mut chrdevs = Vec::new();
-    for (i, (system, addr)) in chrdev_configs.iter().enumerate()
+    it930x.write_gpio(7, true).expect("gpio7 write failed");
+    it930x.write_gpio(2, false).expect("gpio2 write failed");
+
+    it930x.set_gpio_mode(11, it930x::GpioMode::Out, true).expect("gpio11 mode failed");
+    it930x.write_gpio(11, false).expect("gpio11 write failed.");
+
+    // ここから先は、Px4Device に移したので、後で消しておく。
+    // Px4Device の init() で、R850 や RT710 の read_regs が走るので、いつ init() すべきかは、ちゃんと考える必要がある。
+    let mut px4dev = Px4Device::new(&it930x);
+    println!("[debug] px4_dev.init() start => ");
+    if let Err(e) = px4dev.init()
     {
-        // px4_device.c 1128 行目に chrdev4->tc90522.i2c = &it930x->i2c_master[1]; とあり
-        // it930x.c の 571 行目で、priv->i2c[i].bus = i + 1; で、
-        // it930x.c の 575 行目で、it930x->i2c_master[i].priv = &priv->i2c[i] とあるので、
-        // bus 番号は 2 で固定。
-        // -> px4 device の場合の話っぽい。
-        //  -> pxmlt device の場合は、&it930x->i2c_master[input->i2c_bus - 1]; みたいになってる。
-        //  -> s1ur や m1ur は [2] なので bus 番号は 3 らしい。
-        // あと、CHRDEV ごとにアドレスが違くて、0x10〜0x13。
-        let tc90522 = TC90522::new(&it930x, 2, *addr);
-        
-        let tuner = match system
-        {
-            System::ISDB_S => Tuner::RT710(RT710::new(&tc90522, 0x7a)),
-            System::ISDB_T => Tuner::R850(R850::new(&tc90522, 0x7c)),
-        };
-
-        chrdevs.push(
-            Px4Chrdev
-            {
-                system: *system,
-                port_number: i as u8 + 1,
-                slave_number: i as u8,
-                sync_byte: ((i as u8 + 1) << 4) | 0x07,
-                tc90522: tc90522,
-                tuner: tuner,
-            }
-        );
-    }
-
-    for chrdev in &mut chrdevs
-    {
-        //chrdev.tc90522.init();
-
-        match &mut chrdev.tuner
-        {
-            Tuner::RT710(t) => t.init(),
-            Tuner::R850(t) => t.init(),
-        }
-    }
-
-    
-    let tc90522 = TC90522::new(&it930x, 2, 0x1f);
-
-    // addr は、要確認。
-    // 4つあるうちの2つを選ぶ、感じのはず。
-    let mut rt710 = RT710::new(&tc90522, 0x7a);
-    if let Err(e) = rt710.init()
-    {
-        println!("Failed to initialize RT710.: {}", e);
+        println!("Failed to TunerError: {}", e);
         return;
     }
-
-    println!("RT710 Initialization successful.");
 
 }
