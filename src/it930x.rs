@@ -127,7 +127,7 @@ impl<B: BusOps> IT930x<B>
         tx.extend_from_slice(wdata);
 
         // Checksum
-        let chk = checksum(&tx[1..]);
+        let chk = checksum(&tx[1..(tx_len - 2)]);
         tx.push((chk >> 8) as u8);
         tx.push((chk & 0xff) as u8);
         
@@ -139,6 +139,10 @@ impl<B: BusOps> IT930x<B>
         //let mut rx = vec![0u8; rx_len];
         let mut rx = [0u8; 256];
         let rlen = self.bus.ctrl_rx(&mut rx).map_err(CtrlMsgError::Bus)?;
+
+        // debug
+        dump_hex("CTRL_MSG WB", &tx);
+        dump_hex("CTRL_MSG RB (expect)", &rx[0..rlen]);
 
         // packet size validate
         //let len = rx[0] as usize;
@@ -186,10 +190,6 @@ impl<B: BusOps> IT930x<B>
 
         // rx packet data copy
         rdata.copy_from_slice(&rx[3..3 + rdata.len()]);
-
-        // debug
-        dump_hex("CTRL_MSG WB", &tx);
-        dump_hex("CTRL_MSG RB (expect)", &rx);
 
         // 必要なら、ここで Mutex を解除 (Rust で要るのかは、わからん)
 
@@ -266,7 +266,7 @@ impl<B: BusOps> IT930x<B>
     pub fn write_reg_mask(&self, reg: u32, val: u8, mask: u8) -> Result<(), CtrlMsgError>
     {
         // mask が 0 なら、何もできないので終了
-        if mask == 0{return Ok(());}
+        if mask == 0{return Err(CtrlMsgError::InvalidLength);}
         
         // mask が ff なら そのまま使うので、そのまま処理
         if mask == 0xff{return self.write_regs(reg, &[val]);}

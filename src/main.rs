@@ -109,7 +109,6 @@ fn main()
     it930x.set_gpio_mode(11, it930x::GpioMode::Out, true).expect("gpio11 mode failed");
     it930x.write_gpio(11, false).expect("gpio11 write failed.");
 
-    // ここから先は、Px4Device に移したので、後で消しておく。
     // Px4Device の init() で、R850 や RT710 の read_regs が走るので、いつ init() すべきかは、ちゃんと考える必要がある。
     let mut px4dev = Px4Device::new(&it930x);
     println!("[debug] px4_dev.init() start => ");

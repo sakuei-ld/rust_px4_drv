@@ -27,6 +27,11 @@ impl<'a, B: BusOps> TC90522<'a, B>
 {
     pub fn new(it930x: &'a IT930x<B>, bus: u8, i2c_addr: u8) -> Self
     {
+        println!(
+            "[tc90522.new] bus={} tc90522_addr=0x{:02X}",
+            bus, i2c_addr
+        );
+
         TC90522
         {
             it930x,
@@ -95,8 +100,8 @@ impl<'a, B: BusOps> TC90522<'a, B>
     {
         let _lock = self.i2c_lock.lock().unwrap();
 
-        //*
-        // Cの特別扱い分岐の再現
+    /*
+    // Cの特別扱い分岐の再現
     if requests.len() == 2
         && requests[0].req == I2CRequestType::Write
         && requests[1].req == I2CRequestType::Read
@@ -131,15 +136,31 @@ impl<'a, B: BusOps> TC90522<'a, B>
 
         return self.it930x.i2c_master_request(self.bus, &mut master);
     }
-    //*/
+    */
 
         for req in requests.iter_mut()
         {
+            println!(
+                "[tc90522.req] target_addr=0x{:02X} {:?} len={} first={:02X?}",
+                req.addr, req.req, req.data.len(), &req.data.get(..req.data.len().min(8)).unwrap_or(&[])
+            );
+
             match req.req
             {
                 I2CRequestType::Read =>
                 {
                     let mut write_buf = [0xFE, (req.addr << 1) | 0x01];
+
+                    // debug
+                    println!(
+                        "[tc90522->it930x] READ-SET bus={} it930x_addr=0x{:02X} data={:02X?}",
+                        self.bus, self.i2c_addr, &write_buf
+                    );
+                    println!(
+                        "[tc90522->it930x] READ-DATA bus={} it930x_addr=0x{:02X} len={}",
+                        self.bus, self.i2c_addr, req.data.len()
+                    );
+
                     let mut master = 
                     [
                         I2CCommRequest{
@@ -168,6 +189,12 @@ impl<'a, B: BusOps> TC90522<'a, B>
                     buf.push(0xFE);
                     buf.push(req.addr << 1);
                     buf.extend_from_slice(req.data);
+
+                    // debug
+                    println!(
+                        "[tc90522->it930x] WRITE bus={} it930x_addr=0x{:02X} data={:02X?}", 
+                        self.bus, self.i2c_addr, &buf
+                    );
 
                     let mut master = [
                         I2CCommRequest{
