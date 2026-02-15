@@ -111,11 +111,20 @@ fn main()
 
     // Px4Device の init() で、R850 や RT710 の read_regs が走るので、いつ init() すべきかは、ちゃんと考える必要がある。
     let mut px4dev = Px4Device::new(&it930x);
+
+    println!("[debug] px4_dev.set_power() start => ");
+    if let Err(e) = px4dev.set_power(true)
+    {
+        println!("Failed to TunerError: {}", e);
+    }
+
     println!("[debug] px4_dev.init() start => ");
     if let Err(e) = px4dev.init()
     {
         println!("Failed to TunerError: {}", e);
         return;
     }
+
+    println!("[debug] Passed!")
 
 }

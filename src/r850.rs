@@ -255,8 +255,8 @@ impl<'a, B: BusOps> R850<'a, B>
         Self 
         { 
             tc90522: TC90522::new(it930x, tc90522_bus, tc90522_addr), 
-            //i2c_addr: 0x7c, 
-            i2c_addr: 0x3e,
+            i2c_addr: 0x7c, 
+            //i2c_addr: 0x3e,
 
             xtal: 0,
             loop_through: false,

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::itedtv_bus::BusOps;
 use crate::rt710::RT710;
 use crate::r850::R850;
@@ -69,6 +71,33 @@ impl<'a, B: BusOps> Px4Device<'a, B>
             it930x: it930x,
             px4chrdev: Vec::new(),
         }
+    }
+
+    pub fn set_power(&mut self, state: bool) -> Result<(), CtrlMsgError>
+    {
+        println!(
+            "[px4] backend_set_power: {}",
+            if state { "true" } else { "false" }
+        );
+
+        if state
+        {
+            // gpio7 = low
+            self.it930x.write_gpio(7, false)?;
+            std::thread::sleep(Duration::from_millis(80));
+
+            // gpio2 = high
+            self.it930x.write_gpio(2, true)?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        else
+        {
+            // off は失敗しても無視
+            let _ = self.it930x.write_gpio(2, false);
+            let _ = self.it930x.write_gpio(7, true);            
+        }
+
+        Ok(())
     }
 
     pub fn init(&mut self) -> Result<(), TunerError>

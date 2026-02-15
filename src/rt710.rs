@@ -163,8 +163,8 @@ impl<'a, B: BusOps> RT710<'a, B>
         Self 
         {
             tc90522: TC90522::new(it930x, tc90522_bus, tc90522_addr), 
-            //i2c_addr: 0x7a, // 決まっているので 
-            i2c_addr: 0x3d, // bit数が違うらしい？
+            i2c_addr: 0x7a, // 決まっているので 
+            //i2c_addr: 0x3d, // bit数が違うらしい？
             // px4_device.c の 1134〜1144行目
             config: RT710Config { xtal: 24000, loop_through: false, clock_out: false, signal_output_mode: SignalOutputMode::Differential, agc_mode: AgcMode::Positive, vga_atten_mode: VgaAttenuateMode::Off, fine_gain: FineGain::FineGain3DB, scan_mode: ScanMode::Manual, },
             priv_: RT710Priv { lock: Mutex::new(()), init: false, freq: 0, chip: RT710ChipType::RT710, }
