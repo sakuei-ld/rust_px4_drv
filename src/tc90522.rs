@@ -8,6 +8,14 @@ use crate::{it930x::IT930x, itedtv_bus::BusOps};
 // 同じ定義を使うだけ
 use crate::it930x::{I2CRequestType, I2CCommRequest, CtrlMsgError};
 
+// いらないのでは？
+#[derive(Clone, Copy, Debug)]
+pub struct I2CAddr(pub u8);
+
+#[derive(Clone, Copy, Debug)]
+pub struct Reg(pub u8);
+
+
 pub struct TC90522<'a, B: BusOps>
 {
     it930x: &'a IT930x<B>,
@@ -18,14 +26,16 @@ pub struct TC90522<'a, B: BusOps>
     // TC90522 の I2Cアドレス
     pub i2c_addr: u8,
 
-    // 内部制御用
-    ctrl_lock: Mutex<()>,
-    i2c_lock: Mutex<()>,
+    // 内部の排他制御用
+    lock: Mutex<()>,
+
+    // cにあるらしいので、一旦保持
+    is_secondary: bool,
 }
 
 impl<'a, B: BusOps> TC90522<'a, B>
 {
-    pub fn new(it930x: &'a IT930x<B>, bus: u8, i2c_addr: u8) -> Self
+    pub fn new(it930x: &'a IT930x<B>, bus: u8, i2c_addr: u8, is_secondary: bool) -> Self
     {
         println!(
             "[tc90522.new] bus={} tc90522_addr=0x{:02X}",
@@ -37,68 +47,49 @@ impl<'a, B: BusOps> TC90522<'a, B>
             it930x,
             bus,
             i2c_addr,
-            ctrl_lock: Mutex::new(()),
-            i2c_lock: Mutex::new(()),
+            lock: Mutex::new(()),
+            is_secondary,
         }
     }
 
     pub fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError>
     {
-        if buf.is_empty()
+        let _lock = self.lock.lock().unwrap();
+        self.read_regs_nolock(reg, buf)
+    }
+
+    pub fn read_multiple_regs(&self, regs: &mut [(u8, &mut [u8])]) -> Result<(), CtrlMsgError>
+    {
+        let _lock = self.lock.lock().unwrap();
+
+        for (reg, data) in regs.iter_mut()
         {
-            return Err(CtrlMsgError::InvalidLength);
+            self.read_regs_nolock(*reg, data)?;
         }
 
-        let _lock = self.ctrl_lock.lock().unwrap();
-        let mut write_buf = [reg];
-
-        let mut reqs =
-        [
-            I2CCommRequest
-            {
-                addr: self.i2c_addr,
-                data: &mut write_buf,
-                req: I2CRequestType::Write,
-            },
-            I2CCommRequest
-            {
-                addr: self.i2c_addr,
-                data: buf,
-                req: I2CRequestType::Read,
-            }
-        ];
-
-        self.it930x.i2c_master_request(self.bus, &mut reqs)
+        Ok(())
     }
 
     pub fn write_regs(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError>
     {
-        if buf.is_empty() || (buf.len() > 254)
+        let _lock = self.lock.lock().unwrap();
+        self.write_regs_nolock(reg, buf)
+    }
+
+    pub fn write_multiple_regs(&self, regs: &[(u8, &[u8])]) -> Result<(), CtrlMsgError>
+    {
+        let _lock = self.lock.lock().unwrap();
+        for &(reg, data) in regs
         {
-            return Err(CtrlMsgError::InvalidLength);
+            self.write_regs_nolock(reg, data)?;
         }
 
-        let mut wbuf = Vec::with_capacity(1 + buf.len());
-        wbuf.push(reg);
-        wbuf.extend_from_slice(buf);
-        
-        let mut req = 
-        [
-            I2CCommRequest
-            {
-                addr: self.i2c_addr,
-                data: &mut wbuf,
-                req: I2CRequestType::Write,
-            }
-        ];
-
-        let _lock = self.ctrl_lock.lock().unwrap();
-        self.it930x.i2c_master_request(self.bus, &mut req)
+        Ok(())
     }
 
     pub fn i2c_master_request(&self, requests: &mut [I2CCommRequest]) -> Result<(), CtrlMsgError>
     {
-        let _lock = self.i2c_lock.lock().unwrap();
+        let _lock = self.lock.lock().unwrap();
 
     /*
     // Cの特別扱い分岐の再現
@@ -209,5 +200,60 @@ impl<'a, B: BusOps> TC90522<'a, B>
             }
         }
         Ok(())
+    }
+}
+
+impl<'a, B: BusOps> TC90522<'a, B>
+{
+    fn read_regs_nolock(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError>
+    {
+        if buf.is_empty()
+        {
+            return Err(CtrlMsgError::InvalidLength);
+        }
+
+        let mut write_buf = [reg];
+
+        let mut reqs =
+        [
+            I2CCommRequest
+            {
+                addr: self.i2c_addr,
+                data: &mut write_buf,
+                req: I2CRequestType::Write,
+            },
+            I2CCommRequest
+            {
+                addr: self.i2c_addr,
+                data: buf,
+                req: I2CRequestType::Read,
+            }
+        ];
+
+        self.it930x.i2c_master_request(self.bus, &mut reqs)
+    }
+
+    fn write_regs_nolock(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError>
+    {
+        if buf.is_empty() || (buf.len() > 254)
+        {
+            return Err(CtrlMsgError::InvalidLength);
+        }
+
+        let mut wbuf = Vec::with_capacity(1 + buf.len());
+        wbuf.push(reg);
+        wbuf.extend_from_slice(buf);
+        
+        let mut req = 
+        [
+            I2CCommRequest
+            {
+                addr: self.i2c_addr,
+                data: &mut wbuf,
+                req: I2CRequestType::Write,
+            }
+        ];
+
+        self.it930x.i2c_master_request(self.bus, &mut req)
     }
 }
