@@ -1,6 +1,6 @@
 // TC90522 の制御用
 
-use std::sync::{Mutex, atomic::{AtomicU8, Ordering}};
+use std::sync::Mutex;
 
 // 多分、これで大丈夫だと思う。
 use crate::{it930x::IT930x, itedtv_bus::BusOps};
@@ -200,6 +200,53 @@ impl<'a, B: BusOps> TC90522<'a, B>
             }
         }
         Ok(())
+    }
+
+    pub fn sleep_s(&self, sleep: bool) -> Result<(), CtrlMsgError>
+    {
+        if sleep
+        {
+            self.write_multiple_regs(
+                &[(0x13, &[0x80]), (0x17, &[0xFF])]
+            )
+        }
+        else
+        {
+            self.write_multiple_regs(
+                &[(0x13, &[0x00]), (0x17, &[0x00])]
+            )
+        }
+    }
+
+    pub fn set_agc_s(&self, on: bool) -> Result<(), CtrlMsgError>
+    {
+        let mut r10 = if self.is_secondary { 0x30 } else { 0xB0 };
+        let mut r0a = 0x00;
+        let mut r11 = 0x02;
+
+        if on 
+        {
+            r0a = 0xFF;
+            r10 |= 0x02;
+            r11 = 0x00;
+        }
+
+        self.write_multiple_regs(
+            &[(0x0A, &[r0a]), (0x10, &[r10]), (0x11, &[r11]), (0x03, &[0x01])]
+        )
+    }
+
+    pub fn sleep_t(&self, sleep: bool) -> Result<(), CtrlMsgError>
+    {
+        self.write_regs(0x03, if sleep {&[0xF0]} else {&[0x00]})
+    }
+
+    pub fn set_agc_t(&self, on: bool) -> Result<(), CtrlMsgError>
+    {
+        let r23 = if on { 0x4D & !0x01 } else { 0x4D };
+        self.write_multiple_regs(
+            &[(0x25, &[0x00]), (0x20, &[0x00]), (0x23, &[r23]), (0x01, &[0x50])]
+        )
     }
 }
 

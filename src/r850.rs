@@ -18,6 +18,15 @@ pub const INIT_REGS: [u8; R850_NUM_REGS] = [
     0x53, 0xab, 0x5b, 0x46, 0xb3, 0x93, 0x6e, 0x41,
 ];
 
+const SLEEP_REGS: [u8; R850_NUM_REGS] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x33, 0xee, 0xb9, 0xfe, 0x0f, 0xe1, 0x04, 0x30,
+	0x86, 0xfb, 0xf8, 0xb0, 0xd2, 0x81, 0xcd, 0x46,
+	0x37, 0x44, 0x89, 0x8c, 0x55, 0x95, 0x07, 0x23,
+	0x21, 0xf1, 0x4c, 0x5f, 0xc4, 0x20, 0xa9, 0xfc,
+	0x53, 0xab, 0x0b, 0x46, 0xb3, 0x93, 0x6e, 0x41
+];
+
 // 設定
 #[derive(Debug, Clone, Copy)]
 pub struct R850Config {
@@ -256,7 +265,6 @@ impl<'a, B: BusOps> R850<'a, B>
         { 
             tc90522: TC90522::new(it930x, tc90522_bus, tc90522_addr), 
             i2c_addr: 0x7c, 
-            //i2c_addr: 0x3e,
 
             xtal: 0,
             loop_through: false,
@@ -341,6 +349,38 @@ impl<'a, B: BusOps> R850<'a, B>
 
             // init regs
         }
+
+        Ok(())
+    }
+
+    pub fn sleep(&self) -> Result<(), TunerError>
+    {
+        if !self.priv_.init
+        {
+            return  Err(TunerError::InvalidState);
+        }
+
+        if self.priv_.sleep
+        {
+            return  Ok(());
+        }
+
+        let _lock = self.priv_.lock.lock().unwrap();
+
+        self.priv_.regs.copy_from_slice(&SLEEP_REGS);
+
+        if !self.loop_through
+        {
+            self.priv_.regs[0x08] |= 0x40;
+        }
+
+        // debug
+        println!(
+            "[debug] rt710.sleep chip={:?} loop_through={} r08=0x{:02x}",
+            self.priv_.chip, self.loop_through, self.priv_.regs[0x08]
+        );
+
+        self.write_regs(0x08, &self.priv_.regs)?;
 
         Ok(())
     }

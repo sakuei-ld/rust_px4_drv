@@ -10,6 +10,11 @@ use crate::px4_device::TunerError;
 
 const NUM_REGS: usize = 0x10; // 実際の値に合わせて調整
 
+const SLEEP_REGS: [u8; NUM_REGS] = [
+    0xff, 0x5c, 0x88, 0x30, 0x41, 0xc8, 0xed, 0x25,
+	0x47, 0xfc, 0x48, 0xa2, 0x08, 0x0f, 0xf3, 0x59
+];
+
 #[derive(Default, Clone, Copy)]
 struct BandwidthParam {
     coarse: u8,
@@ -87,7 +92,7 @@ pub struct RT710<'a, B: BusOps>
 
 impl<'a, B: BusOps> RT710<'a, B>
 {
-    pub fn reverse_bit(val: u8) -> u8
+    fn reverse_bit(val: u8) -> u8
     {
         let mut t = val;
 
@@ -164,7 +169,6 @@ impl<'a, B: BusOps> RT710<'a, B>
         {
             tc90522: TC90522::new(it930x, tc90522_bus, tc90522_addr), 
             i2c_addr: 0x7a, // 決まっているので 
-            //i2c_addr: 0x3d, // bit数が違うらしい？
             // px4_device.c の 1134〜1144行目
             config: RT710Config { xtal: 24000, loop_through: false, clock_out: false, signal_output_mode: SignalOutputMode::Differential, agc_mode: AgcMode::Positive, vga_atten_mode: VgaAttenuateMode::Off, fine_gain: FineGain::FineGain3DB, scan_mode: ScanMode::Manual, },
             priv_: RT710Priv { lock: Mutex::new(()), init: false, freq: 0, chip: RT710ChipType::RT710, }
@@ -197,6 +201,44 @@ impl<'a, B: BusOps> RT710<'a, B>
 
         // いらないのでは？
         println!("RT710 init done. chip: {:?}, reg03=0x{:02x}", self.priv_.chip, tmp[0]);
+        Ok(())
+    }
+
+    pub fn sleep(&self) -> Result<(), TunerError>
+    {
+        if !self.priv_.init
+        {
+            return  Err(TunerError::InvalidState);
+        }
+
+        let mut regs = SLEEP_REGS;
+
+        let _lock = self.priv_.lock.lock().unwrap();
+
+        match self.priv_.chip
+        {
+            RT710ChipType::RT720 =>
+            {
+                regs[0x01] = 0x5e;
+                regs[0x03] |= 0x20;
+            }
+            _ =>
+            {
+                if self.config.clock_out
+                {
+                    regs[0x03] = 0x20;
+                }
+            }
+        }
+
+        // debug
+        println!(
+            "[debug] rt710.sleep chip={:?} clock_out={} r01=0x{:02x} r03=0x{:02x}",
+            self.priv_.chip, self.config.clock_out, regs[0x01], regs[0x03]
+        );
+
+        self.write_regs(0x00, &regs)?;
+
         Ok(())
     }
 }

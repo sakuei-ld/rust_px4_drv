@@ -1,3 +1,4 @@
 .vscode
 /target
 it930x-firmware.bin
+.DS_Store

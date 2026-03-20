@@ -15,6 +15,8 @@ pub enum TunerError
     CtrlMsg(#[from] CtrlMsgError),  // CtrlMsgError をラップ
     #[error("R850 chip not detected.")]
     ChipNotDetected,
+    #[error("Invalid state.")]
+    InvalidState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +36,20 @@ const PX4_CHRDEV_CONFIGS: [(System, u8); 4] = [
     (System::ISDB_T, 0x10),
     (System::ISDB_T, 0x12),
 ];
+
+// チューナーが開かれる際に、それぞれの復調器に書き込むパラメータ(らしい)
+const TC_INIT_T: [(u8, u8); 10] = [
+    (0xb0, 0xa0), (0xb2, 0x3d), (0xb3, 0x25), (0xb4, 0x8b), (0xb5, 0x4b),
+    (0xb6, 0x3f), (0xb7, 0xff), (0xb8, 0xc0), (0x1f, 0x00), (0x75, 0x00),
+];
+const TC_INIT_S: [(u8, u8); 3] = [
+    (0x15, 0x00), (0x1d, 0x00), (0x04, 0x02),
+];
+
+// デバイス全体の初期化用
+const TC_INIT_S0: [(u8, u8); 2] = [(0x07, 0x31), (0x08, 0x77)];
+const TC_INIT_T0: [(u8, u8); 2] = [(0x0e, 0x77), (0x0f, 0x13)];
+
 
 
 pub enum Tuner<'a, B: BusOps>
