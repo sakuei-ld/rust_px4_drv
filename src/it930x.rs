@@ -4,14 +4,12 @@
 // これに関しては、いろんなところで使うので、実際はここじゃない方が良いかもしれない。
 // 下記2つで i2c_comm.h 17 〜 26 の移植
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum I2CRequestType
-{
+pub enum I2CRequestType {
     Read,
     Write,
 }
 
-pub struct I2CCommRequest<'a>
-{
+pub struct I2CCommRequest<'a> {
     pub addr: u8,
     pub data: &'a mut [u8],
     pub req: I2CRequestType,
@@ -20,12 +18,11 @@ pub struct I2CCommRequest<'a>
 use crate::itedtv_bus::{BusError, BusOps};
 
 // エラー型
-// 
+//
 use thiserror::Error;
 #[derive(Debug, Error)]
 //#[derive(Debug)]
-pub enum CtrlMsgError
-{
+pub enum CtrlMsgError {
     #[error("bus error")]
     Bus(BusError),
     #[error("invalid length")]
@@ -40,36 +37,35 @@ pub enum CtrlMsgError
     DeviceError(u8),
     #[error("EEPROM not responding or invalid")]
     EepromError,
+    #[error("invalid device state: {0}")]
+    InvalidDeviceState(String), // 何が不正なのかメッセージを入れられるようにする
+    #[error("unsupported system")]
+    UnsupportedSystem,
     #[error("file I/O error: {0}")]
     IO(#[from] std::io::Error),
 }
 
-use std::os::macos::raw::stat;
+//use std::os::macos::raw::stat;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 // シーケンス管理
-pub struct IT930x<B: BusOps>
-{
+pub struct IT930x<B: BusOps> {
     bus: B,
     seq: AtomicU8,
     config: IT930xConfig,
     ctrl_lock: Mutex<()>,
     i2c_lock: Mutex<()>,
 
-    gpio_lock: Mutex<()>,
     gpio_status: Mutex<[GpioStatus; 16]>,
 }
 
 // Checksum ... it930x.c 58 〜 76 の移植
-fn checksum(buf: &[u8]) -> u16
-{
+fn calc_checksum(buf: &[u8]) -> u16 {
     let mut sum: u16 = 0;
     let mut iter = buf.chunks(2);
 
-    while let Some(chunk) = iter.next()
-    {
-        let word = match chunk
-        {
+    while let Some(chunk) = iter.next() {
+        let word = match chunk {
             [a, b] => ((*a as u16) << 8) | (*b as u16),
             [a] => (*a as u16) << 8,
             _ => 0,
@@ -78,7 +74,6 @@ fn checksum(buf: &[u8]) -> u16
     }
     !sum
 }
-
 
 // debug用
 fn dump_hex(label: &str, data: &[u8]) {
@@ -89,12 +84,9 @@ fn dump_hex(label: &str, data: &[u8]) {
     println!();
 }
 
-
-impl<B: BusOps> IT930x<B>
-{
+impl<B: BusOps> IT930x<B> {
     // it930x.c 78〜176 の移植 ... おそらく Mutex が要るので、あとで調査する。
-    pub fn ctrl_msg(&self, cmd: u16, wdata: &[u8], rdata: &mut [u8],) -> Result<(), CtrlMsgError>
-    {        
+    pub fn ctrl_msg(&self, cmd: u16, wdata: &[u8], rdata: &mut [u8]) -> Result<(), CtrlMsgError> {
         // Mutex
         let _lock = self.ctrl_lock.lock().unwrap();
 
@@ -102,11 +94,10 @@ impl<B: BusOps> IT930x<B>
 
         // TX packet 送信
         // TX packet の total size
-        let tx_len =  1 + 2 + 1 + wdata.len() + 2;
+        let tx_len = 1 + 2 + 1 + wdata.len() + 2;
 
         // 一応、表現可能サイズを超える場合はエラー
-        if tx_len - 1 > u8::MAX as usize
-        {
+        if tx_len - 1 > u8::MAX as usize {
             return Err(CtrlMsgError::InvalidLength);
         }
 
@@ -119,7 +110,7 @@ impl<B: BusOps> IT930x<B>
         // CMD
         tx.push((cmd >> 8) as u8);
         tx.push((cmd & 0xff) as u8);
-        
+
         // SEQ
         tx.push(seq);
 
@@ -127,10 +118,10 @@ impl<B: BusOps> IT930x<B>
         tx.extend_from_slice(wdata);
 
         // Checksum
-        let chk = checksum(&tx[1..(tx_len - 2)]);
+        let chk = calc_checksum(&tx[1..(tx_len - 2)]);
         tx.push((chk >> 8) as u8);
         tx.push((chk & 0xff) as u8);
-        
+
         // USB 送信
         self.bus.ctrl_tx(&tx).map_err(CtrlMsgError::Bus)?;
 
@@ -150,51 +141,42 @@ impl<B: BusOps> IT930x<B>
         //{
         //    return Err(CtrlMsgError::InvalidLength);
         //}
-        if rlen < 5
-        {
+        if rlen < 5 {
             return Err(CtrlMsgError::InvalidLength);
         }
 
         let frame_len = rx[0] as usize + 1;
-        if frame_len < 5 || frame_len > rlen
-        {
+        if frame_len < 5 || frame_len > rlen {
             return Err(CtrlMsgError::InvalidLength);
         }
 
         // checksum validate
         let recv_chk = ((rx[frame_len - 2] as u16) << 8) | (rx[frame_len - 1] as u16);
-        if checksum(&rx[1..frame_len - 2]) != recv_chk
-        {
+        if calc_checksum(&rx[1..frame_len - 2]) != recv_chk {
             return Err(CtrlMsgError::InvalidChecksum);
         }
 
         // packet seq validate
         let resp_seq = rx[1];
-        if resp_seq != seq
-        {
+        if resp_seq != seq {
             return Err(CtrlMsgError::InvalidSequence);
         }
 
         // packet status check
         let status = rx[2];
-        if status != 0
-        {
+        if status != 0 {
             return Err(CtrlMsgError::DeviceError(status));
         }
 
         // 一応、サイズチェック
-        if frame_len - 5 < rdata.len()
-        {
+        if frame_len - 5 < rdata.len() {
             return Err(CtrlMsgError::InvalidLength);
         }
 
         // rx packet data copy
         rdata.copy_from_slice(&rx[3..3 + rdata.len()]);
 
-        // 必要なら、ここで Mutex を解除 (Rust で要るのかは、わからん)
-
         Ok(())
-
     }
 }
 
@@ -211,30 +193,25 @@ const IT930X_CMD_I2C_READ: u16 = 0x002a;
 const IT930X_CMD_I2C_WRITE: u16 = 0x002b;
 
 // it930x.c 44 〜 56 の移植
-fn it930x_reg_length(reg: u32) -> u8
-{
-    match reg
-    {
+fn reg_length(reg: u32) -> u8 {
+    match reg {
         r if r & 0xff000000 != 0 => 4,
         r if r & 0x00ff0000 != 0 => 3,
         r if r & 0x0000ff00 != 0 => 2,
-        _ => 1, 
+        _ => 1,
     }
 }
 
-impl<B: BusOps> IT930x<B>
-{
+impl<B: BusOps> IT930x<B> {
     // it930x.c 178 〜 203 の移植 ... read_reg は実装しない。(要素数1の配列を送り付ければいいので)
-    pub fn read_regs(&self, reg: u32, data: &mut [u8],) -> Result<(), CtrlMsgError>
-    {
-        if data.len() > 251
-        {
+    pub fn read_regs(&self, reg: u32, data: &mut [u8]) -> Result<(), CtrlMsgError> {
+        if data.len() > 251 {
             return Err(CtrlMsgError::InvalidLength);
         }
 
         let mut buf = [0u8; 6];
         buf[0] = data.len() as u8;
-        buf[1] = it930x_reg_length(reg);
+        buf[1] = reg_length(reg);
         buf[2] = ((reg >> 24) & 0xff) as u8;
         buf[3] = ((reg >> 16) & 0xff) as u8;
         buf[4] = ((reg >> 8) & 0xff) as u8;
@@ -244,16 +221,14 @@ impl<B: BusOps> IT930x<B>
     }
 
     // it930x.c 210〜233 の移植 ... write_reg は実装しない。(要素数1の配列を送り付ければいいので)
-    pub fn write_regs(&self, reg: u32, data: &[u8],) -> Result<(), CtrlMsgError>
-    {
-        if data.len() > 244
-        {
+    pub fn write_regs(&self, reg: u32, data: &[u8]) -> Result<(), CtrlMsgError> {
+        if data.len() > 244 {
             return Err(CtrlMsgError::InvalidLength);
         }
 
-        let mut buf= Vec::with_capacity(6 + data.len());
+        let mut buf = Vec::with_capacity(6 + data.len());
         buf.push(data.len() as u8);
-        buf.push(it930x_reg_length(reg));
+        buf.push(reg_length(reg));
         buf.push(((reg >> 24) & 0xff) as u8);
         buf.push(((reg >> 16) & 0xff) as u8);
         buf.push(((reg >> 8) & 0xff) as u8);
@@ -263,13 +238,16 @@ impl<B: BusOps> IT930x<B>
         self.ctrl_msg(IT930X_CMD_REG_WRITE, &buf, &mut [])
     }
 
-    pub fn write_reg_mask(&self, reg: u32, val: u8, mask: u8) -> Result<(), CtrlMsgError>
-    {
+    pub fn write_reg_mask(&self, reg: u32, val: u8, mask: u8) -> Result<(), CtrlMsgError> {
         // mask が 0 なら、何もできないので終了
-        if mask == 0{return Err(CtrlMsgError::InvalidLength);}
-        
+        if mask == 0 {
+            return Err(CtrlMsgError::InvalidLength);
+        }
+
         // mask が ff なら そのまま使うので、そのまま処理
-        if mask == 0xff{return self.write_regs(reg, &[val]);}
+        if mask == 0xff {
+            return self.write_regs(reg, &[val]);
+        }
 
         // 1byte 読み込み
         let mut cur = [0u8; 1];
@@ -278,9 +256,11 @@ impl<B: BusOps> IT930x<B>
 
         // チェック
         let new_val = (old & !mask) | (val & mask);
-        
+
         // 変化がない場合は書き込まない (USB負荷軽減)
-        if new_val == old{return Ok(());}
+        if new_val == old {
+            return Ok(());
+        }
 
         // 1byte 書き込み
         self.write_regs(reg, &[new_val])?;
@@ -289,8 +269,7 @@ impl<B: BusOps> IT930x<B>
 }
 
 #[derive(Clone, Debug)]
-pub struct StreamInput
-{
+pub struct StreamInput {
     pub enable: bool,
     pub is_parallel: bool,
     pub port_number: u8,
@@ -301,22 +280,17 @@ pub struct StreamInput
     pub sync_byte: u8,
 }
 
-pub struct IT930xConfig
-{
+pub struct IT930xConfig {
     pub i2c_speed: u8,
     pub xfer_size: u32,
     pub inputs: [StreamInput; 5],
 }
 
-// 
-impl Default for IT930xConfig
-{
-    fn default() -> Self 
-    {
-        let inputs =
-        [
-            StreamInput
-            {
+// メモ: sync_byte のアクセスが必要になるかも？
+impl Default for IT930xConfig {
+    fn default() -> Self {
+        let inputs = [
+            StreamInput {
                 enable: true,
                 is_parallel: false,
                 port_number: 1,
@@ -326,8 +300,7 @@ impl Default for IT930xConfig
                 packet_len: 188,
                 sync_byte: 0x17,
             },
-            StreamInput
-            {
+            StreamInput {
                 enable: true,
                 is_parallel: false,
                 port_number: 2,
@@ -337,8 +310,7 @@ impl Default for IT930xConfig
                 packet_len: 188,
                 sync_byte: 0x27,
             },
-            StreamInput
-            {
+            StreamInput {
                 enable: true,
                 is_parallel: false,
                 port_number: 3,
@@ -348,8 +320,7 @@ impl Default for IT930xConfig
                 packet_len: 188,
                 sync_byte: 0x37,
             },
-            StreamInput
-            {
+            StreamInput {
                 enable: true,
                 is_parallel: false,
                 port_number: 4,
@@ -359,8 +330,7 @@ impl Default for IT930xConfig
                 packet_len: 188,
                 sync_byte: 0x47,
             },
-            StreamInput
-            {
+            StreamInput {
                 enable: false,
                 is_parallel: false,
                 port_number: 0,
@@ -372,8 +342,7 @@ impl Default for IT930xConfig
             },
         ];
 
-        Self
-        {
+        Self {
             i2c_speed: 0x07,
             xfer_size: 188 * 816, // px4_usb.c の it930x->config.xfer_size = 188 * px4_usb_params.xfer_packets; と px4_usb_params.c の .xfer_packets = 816, から
             inputs,
@@ -381,60 +350,55 @@ impl Default for IT930xConfig
     }
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GpioMode
-{
+pub enum GpioMode {
     In,
     Out,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct GpioStatus
-{
+struct GpioStatus {
     mode: GpioMode,
     enable: bool,
 }
 
-impl Default for GpioStatus
-{
+impl Default for GpioStatus {
     fn default() -> Self {
-        Self { mode:GpioMode::In, enable: false }
+        Self {
+            mode: GpioMode::In,
+            enable: false,
+        }
     }
 }
 
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 //use anyhow::{Ok, Result};
 // px4_usb_probe 相当の処理
-impl<B: BusOps> IT930x<B>
-{
+impl<B: BusOps> IT930x<B> {
     // it930x.c 354 〜 378 の移植
-    pub fn read_firmware_version(&self) -> Result<u32, CtrlMsgError>
-    {
+    pub fn read_firmware_version(&self) -> Result<u32, CtrlMsgError> {
         let mut wbuf = [0u8; 1];
         let mut rbuf = [0u8; 4];
 
         wbuf[0] = 1;
         //rbuf[0] = 1;
 
-        self.ctrl_msg(IT930X_CMD_QUERYINFO, &wbuf,&mut rbuf)?;
-        let fw_version = ((rbuf[0] as u32) << 24) | ((rbuf[1] as u32) << 16) | ((rbuf[2] as u32) << 8) | (rbuf[3] as u32);
+        self.ctrl_msg(IT930X_CMD_QUERYINFO, &wbuf, &mut rbuf)?;
+        let fw_version = ((rbuf[0] as u32) << 24)
+            | ((rbuf[1] as u32) << 16)
+            | ((rbuf[2] as u32) << 8)
+            | (rbuf[3] as u32);
 
-        return Ok(fw_version)
+        return Ok(fw_version);
     }
 
     // it930x.c 619〜630 をそのまま移植
-    pub fn raise(&self) -> Result<(), CtrlMsgError>
-    {
+    pub fn raise(&self) -> Result<(), CtrlMsgError> {
         let mut last_err = None;
 
-        for i in 0..5
-        {
+        for i in 0..5 {
             // readチェックのみ
-            match self.read_firmware_version()
-            {
+            match self.read_firmware_version() {
                 Ok(u32) => return Ok(()),
                 Err(e) => last_err = Some(e),
             }
@@ -443,13 +407,11 @@ impl<B: BusOps> IT930x<B>
         Err(last_err.unwrap())
     }
 
-    pub fn check_epprom(&self) -> Result<(), CtrlMsgError>
-    {
+    pub fn check_epprom(&self) -> Result<(), CtrlMsgError> {
         let mut buf = [0u8; 1];
         self.read_regs(0x4979, &mut buf)?;
 
-        if buf[0] == 0
-        {
+        if buf[0] == 0 {
             return Err(CtrlMsgError::EepromError);
         }
 
@@ -457,13 +419,17 @@ impl<B: BusOps> IT930x<B>
     }
 
     // it930x.c 632 〜 752 の移植
-    pub fn load_firmware<P: AsRef<Path>>(&self, path: P) -> Result<(), CtrlMsgError>
-    {
+    pub fn load_firmware<P: AsRef<Path>>(&self, path: P) -> Result<(), CtrlMsgError> {
         // 1. firmware がロード済みか確認
         let fw_version = self.read_firmware_version()?;
-        if fw_version != 0
-        {
-            println!("Firmware is already loaded. version: {}.{}.{}.{}", (fw_version >> 24) & 0xff, (fw_version >> 24) & 0xff, (fw_version >> 24) & 0xff, fw_version & 0xff);
+        if fw_version != 0 {
+            println!(
+                "Firmware is already loaded. version: {}.{}.{}.{}",
+                (fw_version >> 24) & 0xff,
+                (fw_version >> 16) & 0xff,
+                (fw_version >> 8) & 0xff,
+                fw_version & 0xff
+            );
             return Ok(());
         }
 
@@ -473,19 +439,14 @@ impl<B: BusOps> IT930x<B>
         self.write_regs(0xf103, &[self.config.i2c_speed])?;
 
         // 3. firmware file 読み込み
-        let mut fw_file = File::open(path)?;
-        let mut fw_data = Vec::new();
-        fw_file.read_to_end(&mut fw_data)?;
-
+        let fw_data = std::fs::read(path)?;
         let fw_len = fw_data.len();
         let mut i = 0;
 
         // 4. scatter-write
-        while i < fw_len
-        {
+        while i < fw_len {
             let p = &fw_data[i..];
-            if p[0] != 0x03
-            {
+            if p[0] != 0x03 {
                 eprintln!("Invalid firmware block at offset {}", i);
                 //return Err(rusb::Error::Other.into());
                 return Err(CtrlMsgError::Bus(rusb::Error::Other.into()));
@@ -493,13 +454,11 @@ impl<B: BusOps> IT930x<B>
 
             let m = p[3] as usize;
             let mut len = 0;
-            for j in 0..m
-            {
+            for j in 0..m {
                 len += p[6 + j * 3] as usize;
             }
 
-            if len == 0
-            {
+            if len == 0 {
                 eprintln!("No data in firmware block at offset {}", i);
                 len += 4 + m * 3;
                 i += len;
@@ -519,21 +478,27 @@ impl<B: BusOps> IT930x<B>
 
         // 6. firmware version 確認
         let fw_version = self.read_firmware_version()?;
-        if fw_version == 0
-        {
+        if fw_version == 0 {
             eprintln!("Firmware failed to load (version = 0)");
             //return Err(rusb::Error::Other.into());
-            return Err(CtrlMsgError::Bus(rusb::Error::Other.into()));
+            //return Err(CtrlMsgError::Bus(rusb::Error::Other.into()));
+            return Err(CtrlMsgError::InvalidDeviceState(
+                "Firmware failed to boot (version 0)".to_string(),
+            ));
         }
 
-        println!("Firmware is loaded. version: {}.{}.{}.{}", (fw_version >> 24) & 0xff, (fw_version >> 24) & 0xff, (fw_version >> 24) & 0xff, fw_version & 0xff);
+        println!(
+            "Firmware is loaded. version: {}.{}.{}.{}",
+            (fw_version >> 24) & 0xff,
+            (fw_version >> 16) & 0xff,
+            (fw_version >> 8) & 0xff,
+            fw_version & 0xff
+        );
         return Ok(());
     }
 
-    pub fn config_i2c(&self) -> Result<(), CtrlMsgError>
-    {
-        const I2C_REGS: [[u32; 2]; 5] =
-        [
+    pub fn config_i2c(&self) -> Result<(), CtrlMsgError> {
+        const I2C_REGS: [[u32; 2]; 5] = [
             [0x4975, 0x4971],
             [0x4974, 0x4970],
             [0x4973, 0x496f],
@@ -544,11 +509,9 @@ impl<B: BusOps> IT930x<B>
         self.write_regs(0xf6a7, &[self.config.i2c_speed])?;
         self.write_regs(0xf103, &[self.config.i2c_speed])?;
 
-        for input in self.config.inputs.iter().filter(|i| i.enable)
-        {
+        for input in self.config.inputs.iter().filter(|i| i.enable) {
             let sn = input.slave_number as usize;
-            if sn >= I2C_REGS.len()
-            {
+            if sn >= I2C_REGS.len() {
                 return Err(CtrlMsgError::InvalidLength);
             }
 
@@ -560,22 +523,18 @@ impl<B: BusOps> IT930x<B>
         Ok(())
     }
 
-    pub fn config_stream_input(&self) -> Result<(), CtrlMsgError>
-    {
-        for input in &self.config.inputs
-        {
+    pub fn config_stream_input(&self) -> Result<(), CtrlMsgError> {
+        for input in &self.config.inputs {
             let port = input.port_number as u32;
 
-            if !input.enable
-            {
+            if !input.enable {
                 // input port が disable の場合
                 self.write_regs(0xda4c + port, &[0])?;
                 continue;
             }
 
-            if input.port_number < 2
-            {
-                let v = if input.is_parallel {1} else {0};
+            if input.port_number < 2 {
+                let v = if input.is_parallel { 1 } else { 0 };
                 self.write_regs(0xda58 + port, &[v])?;
             }
 
@@ -592,12 +551,10 @@ impl<B: BusOps> IT930x<B>
         Ok(())
     }
 
-    pub fn config_stream_output(&self) -> Result<(), CtrlMsgError>
-    {
+    pub fn config_stream_output(&self) -> Result<(), CtrlMsgError> {
         self.write_reg_mask(0xda1d, 0x01, 0x01)?;
 
-        let mut ret: Result<(), CtrlMsgError> = (||
-        {
+        let ret: Result<(), CtrlMsgError> = (|| {
             // disable ep4
             self.write_reg_mask(0xdd11, 0x00, 0x20)?;
 
@@ -608,12 +565,11 @@ impl<B: BusOps> IT930x<B>
             self.write_reg_mask(0xdd11, 0x20, 0x20)?;
 
             // threshold of transfer size
-            let x = ((self.config.xfer_size / 4) & 0xffff) as u16;
-            let buf = [(x & 0xff) as u8, ((x >> 8) & 0xff) as u8];
-            self.write_regs(0xdd88, &buf)?;
+            let x = (self.config.xfer_size / 4) as u16;
+            self.write_regs(0xdd88, &x.to_le_bytes())?;
 
             // max bulk packet size
-            let v = ((self.bus.max_bulk_size() / 4) & 0xff) as u8;
+            let v = (self.bus.max_bulk_size() / 4) as u8;
             self.write_regs(0xdd0c, &[v])?;
 
             self.write_reg_mask(0xda05, 0x00, 0x01)?;
@@ -626,15 +582,16 @@ impl<B: BusOps> IT930x<B>
         let ret2 = self.write_reg_mask(0xda1d, 0x00, 0x01);
         let ret3 = self.write_regs(0xd920, &[0]);
 
-        if ret.is_err() { return ret; }
+        if ret.is_err() {
+            return ret;
+        }
         ret2?;
         ret3?;
 
         Ok(())
     }
 
-    pub fn init_warm(&self) -> Result<(), CtrlMsgError>
-    {
+    pub fn init_warm(&self) -> Result<(), CtrlMsgError> {
         self.write_regs(0x4976, &[0])?;
         self.write_regs(0x4bfb, &[0])?;
         self.write_regs(0x4978, &[0])?;
@@ -670,39 +627,36 @@ impl<B: BusOps> IT930x<B>
         Ok(())
     }
 
-    pub fn set_gpio_mode(&self, gpio: i32, mode: GpioMode, enable: bool) -> Result<(), CtrlMsgError>
-    {
-        const GPIO_EN_REGS: [u32; 16] =
-        [
-            0xd8b0, 0xd8b8, 0xd8b4, 0xd8c0,
-            0xd8bc, 0xd8c8, 0xd8c4, 0xd8d0,
-            0xd8cc, 0xd8d8, 0xd8d4, 0xd8e0,
-            0xd8dc, 0xd8e4, 0xd8e8, 0xd8ec,
+    pub fn set_gpio_mode(
+        &self,
+        gpio: i32,
+        mode: GpioMode,
+        enable: bool,
+    ) -> Result<(), CtrlMsgError> {
+        const GPIO_EN_REGS: [u32; 16] = [
+            0xd8b0, 0xd8b8, 0xd8b4, 0xd8c0, 0xd8bc, 0xd8c8, 0xd8c4, 0xd8d0, 0xd8cc, 0xd8d8, 0xd8d4,
+            0xd8e0, 0xd8dc, 0xd8e4, 0xd8e8, 0xd8ec,
         ];
 
-        if gpio <= 0 || gpio > 16
-        {
+        if gpio <= 0 || gpio > 16 {
             return Err(CtrlMsgError::InvalidArgument);
         }
 
         let val = match mode {
             GpioMode::In => 0u8,
-            GpioMode::Out => 1u8,            
+            GpioMode::Out => 1u8,
         };
 
         let idx = (gpio - 1) as usize;
 
-        let _lock = self.gpio_lock.lock().unwrap();
         let mut status = self.gpio_status.lock().unwrap();
 
-        if status[idx].mode != mode
-        {
+        if status[idx].mode != mode {
             status[idx].mode = mode;
             self.write_regs(GPIO_EN_REGS[idx], &[val])?;
         }
 
-        if enable && !status[idx].enable
-        {
+        if enable && !status[idx].enable {
             status[idx].enable = true;
             self.write_regs(GPIO_EN_REGS[idx] + 1, &[1])?;
         }
@@ -710,75 +664,126 @@ impl<B: BusOps> IT930x<B>
         Ok(())
     }
 
-    pub fn write_gpio(&self, gpio: i32, high: bool) -> Result<(), CtrlMsgError>
-    {
-        const GPIO_O_REGS: [u32; 16] = 
-        [
-            0xd8af, 0xd8b7, 0xd8b3, 0xd8bf, 
-            0xd8bb, 0xd8c7, 0xd8c3, 0xd8cf, 
-            0xd8cb, 0xd8d7, 0xd8d3, 0xd8df, 
-            0xd8db, 0xd8e3, 0xd8e7, 0xd8eb, 
+    // GPIOを制御する (itedtv_bus_enable_gpio の移植)
+    pub fn enable_gpio(&self, gpio: u8, enable: bool) -> Result<(), CtrlMsgError> {
+        // Cコードの gpio_on_regs
+        const GPIO_ON_REGS: [u16; 16] = [
+            0xd8b1, 0xd8b9, 0xd8b5, 0xd8c1, 0xd8bd, 0xd8c9, 0xd8c5, 0xd8d1, 0xd8cd, 0xd8d9, 0xd8d5,
+            0xd8e1, 0xd8dd, 0xd8e5, 0xd8e9, 0xd8ed,
         ];
 
-        if gpio <= 0 || gpio > 16
-        {
+        // 引数のチェック (Cコード: gpio <= 0 || gpio > ARRAY_SIZE)
+        // 引数が 1-based なので 0 や 17以上はエラー
+        if gpio == 0 || gpio > GPIO_ON_REGS.len() as u8 {
+            return Err(CtrlMsgError::InvalidArgument);
+        }
+
+        let index = (gpio - 1) as usize;
+
+        // Cコードの mutex_lock(&priv->gpio_lock) に相当
+        let mut status = self.gpio_status.lock().unwrap();
+
+        // 現在の状態と同じなら何もしない (Cコードの最適化ロジック)
+        if status[index].enable == enable {
+            return Ok(());
+        }
+
+        // レジスタ書き込み (Cコード: it930x_write_reg)
+        let addr = GPIO_ON_REGS[index] as u32;
+        let val = if enable { 1 } else { 0 };
+        self.write_regs(addr, &[val])?;
+
+        // 状態を更新
+        status[index].enable = enable;
+
+        Ok(())
+    }
+
+    pub fn read_gpio(&self, gpio: u8) -> Result<bool, CtrlMsgError> {
+        // Cコードの gpio_i_regs
+        const GPIO_I_REGS: [u16; 16] = [
+            0xd8ae, 0xd8b6, 0xd8b2, 0xd8be, 0xd8ba, 0xd8c6, 0xd8c2, 0xd8ce, 0xd8ca, 0xd8d6, 0xd8d2,
+            0xd8de, 0xd8da, 0xd8e2, 0xd8e6, 0xd8ea,
+        ];
+
+        if gpio == 0 || gpio > GPIO_I_REGS.len() as u8 {
+            return Err(CtrlMsgError::InvalidArgument);
+        }
+
+        let index = (gpio - 1) as usize;
+        let status = self.gpio_status.lock().unwrap();
+
+        // Cコードのモードチェックを再現
+        // 入力モードでない場合はエラーにする
+        if status[index].mode != GpioMode::In {
+            return Err(CtrlMsgError::InvalidArgument);
+        }
+
+        // レジスタ読み出し
+        let mut tmp = [0u8; 1];
+        self.read_regs(GPIO_I_REGS[index] as u32, &mut tmp)?;
+
+        Ok(tmp[0] != 0)
+    }
+
+    pub fn write_gpio(&self, gpio: i32, high: bool) -> Result<(), CtrlMsgError> {
+        const GPIO_O_REGS: [u32; 16] = [
+            0xd8af, 0xd8b7, 0xd8b3, 0xd8bf, 0xd8bb, 0xd8c7, 0xd8c3, 0xd8cf, 0xd8cb, 0xd8d7, 0xd8d3,
+            0xd8df, 0xd8db, 0xd8e3, 0xd8e7, 0xd8eb,
+        ];
+
+        if gpio <= 0 || gpio > 16 {
             return Err(CtrlMsgError::InvalidArgument);
         }
 
         let idx = (gpio - 1) as usize;
 
-        let _lock = self.gpio_lock.lock().unwrap();
         let status = self.gpio_status.lock().unwrap();
 
-        if status[idx].mode != GpioMode::Out
-        {
+        if status[idx].mode != GpioMode::Out {
             return Err(CtrlMsgError::InvalidArgument);
         }
 
-        let v = if high {1u8} else {0u8};
+        let v = if high { 1u8 } else { 0u8 };
         self.write_regs(GPIO_O_REGS[idx], &[v])?;
 
         Ok(())
     }
-
 }
 
-impl<B: BusOps> IT930x<B>
-{
-    pub fn i2c_master_request(&self, bus: u8, requests: &mut [I2CCommRequest],) -> Result<(), CtrlMsgError>
-    {
+impl<B: BusOps> IT930x<B> {
+    pub fn i2c_master_request(
+        &self,
+        bus: u8,
+        requests: &mut [I2CCommRequest],
+    ) -> Result<(), CtrlMsgError> {
         // Mutex を掛ける 多分。
         let _lock = self.i2c_lock.lock().unwrap();
 
-        for req in requests.iter_mut()
-        {
-            match req.req 
-            {
-                I2CRequestType::Read =>
-                {
-                    let len = req.data.len();
-                    if len > 251
-                    {
+        for req in requests.iter_mut() {
+            // データ長の取得
+            let len = req.data.len();
+            if len == 0 {
+                return Err(CtrlMsgError::InvalidArgument);
+            }
+
+            match req.req {
+                I2CRequestType::Read => {
+                    if len > 251 {
                         return Err(CtrlMsgError::InvalidLength);
                     }
 
-                    let buf = [len as u8, bus, req.addr << 1,];
+                    let buf = [len as u8, bus, req.addr << 1];
 
                     // debug
-                    println!(
-                        "[i2c_read] bus={} addr=0x{:02x} len={}",
-                        bus, req.addr, len
-                    );
-                    dump_hex("wb", &buf);
+                    //println!("[i2c_read] bus={} addr=0x{:02x} len={}", bus, req.addr, len);
+                    //dump_hex("wb", &buf);
 
-                    self.ctrl_msg(IT930X_CMD_I2C_READ, &buf, req.data,)?;
+                    self.ctrl_msg(IT930X_CMD_I2C_READ, &buf, req.data)?;
                 }
-                
-                I2CRequestType::Write =>
-                {
-                    let len = req.data.len();
-                    if len > (250 - 3)
-                    {
+
+                I2CRequestType::Write => {
+                    if len > (250 - 3) {
                         return Err(CtrlMsgError::InvalidLength);
                     }
 
@@ -789,11 +794,11 @@ impl<B: BusOps> IT930x<B>
                     buf.extend_from_slice(req.data);
 
                     // debug
-                    println!(
-                        "[i2c_write] bus={} addr=0x{:02x} len={}",
-                        bus, req.addr, len
-                    );
-                    dump_hex("wb", &buf);
+                    //println!(
+                    //    "[i2c_write] bus={} addr=0x{:02x} len={}",
+                    //    bus, req.addr, len
+                    //);
+                    //dump_hex("wb", &buf);
 
                     self.ctrl_msg(IT930X_CMD_I2C_WRITE, &buf, &mut [])?;
                 }
@@ -803,12 +808,27 @@ impl<B: BusOps> IT930x<B>
     }
 }
 
-
-impl<B: BusOps> IT930x<B>
-{
-    pub fn new(bus: B) -> Self
-    {
+impl<B: BusOps> IT930x<B> {
+    pub fn new(bus: B) -> Self {
         // 多分、IT930xConfig::default() は、xfer_size の設定もした方がいいと思う。
-        Self { bus, seq: AtomicU8::new(0), config: IT930xConfig::default(), ctrl_lock: Mutex::new(()), i2c_lock: Mutex::new(()), gpio_lock: Mutex::new(()), gpio_status: Mutex::new([GpioStatus::default(); 16]), }
+        Self {
+            bus,
+            seq: AtomicU8::new(0),
+            config: IT930xConfig::default(),
+            ctrl_lock: Mutex::new(()),
+            i2c_lock: Mutex::new(()),
+            gpio_status: Mutex::new([GpioStatus::default(); 16]),
+        }
+    }
+}
+impl<B: BusOps> Drop for IT930x<B> {
+    fn drop(&mut self) {
+        println!("[it930x] Terminating IT930x device...");
+
+        // ストリーミングを停止させる
+        // Cコードの itedtv_bus_stop_streaming 相当
+        if let Err(e) = self.bus.stop_streaming() {
+            eprintln!("[it930x] Failed to stop streaming during drop: {:?}", e);
+        }
     }
 }
