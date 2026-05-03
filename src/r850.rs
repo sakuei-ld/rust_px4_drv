@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use crate::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
 use crate::itedtv_bus::BusOps;
-use crate::tc90522::TC90522;
+use crate::tc90522::{System, TC90522};
 
 use crate::px4_device::TunerError;
 
@@ -80,7 +80,6 @@ pub struct R850Imr {
 // 内部状態
 #[derive(Debug)]
 pub struct R850Priv {
-    pub lock: Mutex<()>,
     pub init: bool,
     pub chip: i32,
     pub xtal_pwr: u8,
@@ -113,7 +112,7 @@ pub struct R850<'a, B: BusOps>
     pub no_lpf_calibration: bool,
 
     pub i2c_addr: u8,
-    priv_: R850Priv,
+    priv_: Mutex<R850Priv>,
 }
 
 impl<'a, B: BusOps> R850<'a, B>
@@ -190,55 +189,63 @@ impl<'a, B: BusOps> R850<'a, B>
     }
 
     // メモ: 初期値(デフォルト値)に戻すイメージ
-    pub fn init_regs(&mut self)
+    pub fn init_regs(&self)
     {
-        self.priv_.regs.copy_from_slice(&INIT_REGS);
+        let mut priv_ptr = self.priv_.lock().unwrap();
+        priv_ptr.regs.copy_from_slice(&INIT_REGS);
 
         // ここで各種微調整も可能らしい。
         // 微調整のコードは、r850.c 619〜633行目を参照
     }
 
-    pub fn check_xtal_power(&mut self) -> Result<(), CtrlMsgError>
+    pub fn check_xtal_power(&self) -> Result<(), CtrlMsgError>
     {
         let bank = 55u8;
         let mut pwr = 3u8; // xtal 24MHz
 
         // 保持するレジスタ状態を初期化し、xtal power 確認のために変更後のレジスタ状態を保持
         self.init_regs();
+
+        let mut priv_ptr = self.priv_.lock().unwrap();
         {
-            let r = &mut self.priv_.regs;
-            if self.priv_.chip != 0 {r[0x2f] &= 0xfd;}
-            else {r[0x2f] &= 0xfc;}
+            //let r = &mut priv_ptr.regs;
+            if priv_ptr.chip != 0 {
+                priv_ptr.regs[0x2f] &= 0xfd;
+            } else {
+                priv_ptr.regs[0x2f] &= 0xfc;
+            }
 
-            r[0x1b] &= 0x80;
-            r[0x1b] |= 0x12;
+            priv_ptr.regs[0x1b] &= 0x80;
+            priv_ptr.regs[0x1b] |= 0x12;
 
-            r[0x1e] &= 0xe0;
-            r[0x1e] |= 0x08;
+            priv_ptr.regs[0x1e] &= 0xe0;
+            priv_ptr.regs[0x1e] |= 0x08;
 
-            r[0x22] &= 0x27;
+            priv_ptr.regs[0x22] &= 0x27;
 
-            r[0x1d] &= 0x0f;
+            priv_ptr.regs[0x1d] &= 0x0f;
 
-            r[0x21] |= 0xf8;
+            priv_ptr.regs[0x21] |= 0xf8;
 
-            r[0x22] &= 0x77;
-            r[0x22] |= 0x80;
+            priv_ptr.regs[0x22] &= 0x77;
+            priv_ptr.regs[0x22] |= 0x80;
             
-            r[0x1f] &= 0x80;
-            r[0x1f] |= 0x40;
-            r[0x1f] &= 0xbf;
+            priv_ptr.regs[0x1f] &= 0x80;
+            priv_ptr.regs[0x1f] |= 0x40;
+            priv_ptr.regs[0x1f] &= 0xbf;
         }
 
+        let mut priv_ptr = self.priv_.lock().unwrap();
+
         // 本体のレジスタに書き込み
-        self.write_regs(0x08, &self.priv_.regs[0x08..R850_NUM_REGS]);
+        self.write_regs(0x08, &priv_ptr.regs[0x08..R850_NUM_REGS]);
 
         // ループで xtal_power を探す
         for i in 0..=3 {
-            self.priv_.regs[0x22] &= 0xcf;
-            self.priv_.regs[0x22] |= i << 4;
+            priv_ptr.regs[0x22] &= 0xcf;
+            priv_ptr.regs[0x22] |= i << 4;
 
-            self.write_regs(0x22, &[self.priv_.regs[0x22]])?;
+            self.write_regs(0x22, &[priv_ptr.regs[0x22]])?;
 
             let mut tmp = [0u8; 1];
             self.read_regs(0x02, &mut tmp)?;
@@ -254,16 +261,16 @@ impl<'a, B: BusOps> R850<'a, B>
             pwr += 1;
         }
         
-        self.priv_.xtal_pwr = pwr;
+        priv_ptr.xtal_pwr = pwr;
 
         Ok(())
     }
 
-    pub fn new(it930x: &'a IT930x<B>, tc90522_bus: u8, tc90522_addr: u8) -> Self
+    pub fn new(it930x: &'a IT930x<B>, tc90522_bus: u8, tc90522_addr: u8, is_secondary: bool) -> Self
     {
         Self 
         { 
-            tc90522: TC90522::new(it930x, tc90522_bus, tc90522_addr), 
+            tc90522: TC90522::new(it930x, tc90522_bus, tc90522_addr, System::ISDB_T, is_secondary), 
             i2c_addr: 0x7c, 
 
             xtal: 0,
@@ -272,9 +279,9 @@ impl<'a, B: BusOps> R850<'a, B>
             no_imr_calibration: false,
             no_lpf_calibration: false,
 
-            priv_: R850Priv
+            priv_: Mutex::new(R850Priv
             {
-                lock: Mutex::new(()),
+                //lock: Mutex::new(()),
                 init: false,
                 chip: 0,
                 xtal_pwr: 0,
@@ -288,25 +295,26 @@ impl<'a, B: BusOps> R850<'a, B>
                     ],
                 mixer_mode: 0,
                 mixer_amp_lpf_imr_cal: 0
-            },
+            }),
         }
     }
 
-    pub fn init(&mut self) -> Result<(), TunerError>
+    pub fn init(&self) -> Result<(), TunerError>
     {
         // 初期状態の設定
         {
-            let _lock = self.priv_.lock.lock().unwrap();
+            //let _lock = self.priv_.lock.lock().unwrap();
+            let mut priv_ptr = self.priv_.lock().unwrap();
 
-            self.priv_.init = false;
+            priv_ptr.init = false;
 
-            self.priv_.chip = 0;
-            self.priv_.sleep = false;
+            priv_ptr.chip = 0;
+            priv_ptr.sleep = false;
 
-            self.priv_.sys.system = R850System::Undefined;
-            self.priv_.sys_curr.system = R850System::Undefined;
+            priv_ptr.sys.system = R850System::Undefined;
+            priv_ptr.sys_curr.system = R850System::Undefined;
 
-            for cal in self.priv_.imr_cal.iter_mut()
+            for cal in priv_ptr.imr_cal.iter_mut()
             {
                 cal.done = false;
                 cal.result = [false; 5];
@@ -326,7 +334,7 @@ impl<'a, B: BusOps> R850<'a, B>
                 {
                     if (tmp[0] & 0x98) != 0
                     {
-                        self.priv_.chip = 0;
+                        priv_ptr.chip = 0;
                         detected = true;
                         break;
                     }
@@ -355,32 +363,32 @@ impl<'a, B: BusOps> R850<'a, B>
 
     pub fn sleep(&self) -> Result<(), TunerError>
     {
-        if !self.priv_.init
+        let mut priv_ptr = self.priv_.lock().unwrap();
+        
+        if !priv_ptr.init
         {
             return  Err(TunerError::InvalidState);
         }
 
-        if self.priv_.sleep
+        if priv_ptr.sleep
         {
             return  Ok(());
         }
 
-        let _lock = self.priv_.lock.lock().unwrap();
-
-        self.priv_.regs.copy_from_slice(&SLEEP_REGS);
+        priv_ptr.regs.copy_from_slice(&SLEEP_REGS);
 
         if !self.loop_through
         {
-            self.priv_.regs[0x08] |= 0x40;
+            priv_ptr.regs[0x08] |= 0x40;
         }
 
         // debug
         println!(
             "[debug] rt710.sleep chip={:?} loop_through={} r08=0x{:02x}",
-            self.priv_.chip, self.loop_through, self.priv_.regs[0x08]
+            priv_ptr.chip, self.loop_through, priv_ptr.regs[0x08]
         );
 
-        self.write_regs(0x08, &self.priv_.regs)?;
+        self.write_regs(0x08, &priv_ptr.regs)?;
 
         Ok(())
     }

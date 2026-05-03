@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use crate::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
 use crate::itedtv_bus::BusOps;
-use crate::tc90522::TC90522;
+use crate::tc90522::{TC90522, System};
 
 use crate::px4_device::TunerError;
 
@@ -163,11 +163,11 @@ impl<'a, B: BusOps> RT710<'a, B>
         self.tc90522.i2c_master_request(&mut reqs)
     }
 
-    pub fn new(it930x: &'a IT930x<B>, tc90522_bus: u8, tc90522_addr: u8) -> Self
+    pub fn new(it930x: &'a IT930x<B>, tc90522_bus: u8, tc90522_addr: u8, is_secondary: bool) -> Self
     {
         Self 
         {
-            tc90522: TC90522::new(it930x, tc90522_bus, tc90522_addr), 
+            tc90522: TC90522::new(it930x, tc90522_bus, tc90522_addr, System::ISDB_S, is_secondary), 
             i2c_addr: 0x7a, // 決まっているので 
             // px4_device.c の 1134〜1144行目
             config: RT710Config { xtal: 24000, loop_through: false, clock_out: false, signal_output_mode: SignalOutputMode::Differential, agc_mode: AgcMode::Positive, vga_atten_mode: VgaAttenuateMode::Off, fine_gain: FineGain::FineGain3DB, scan_mode: ScanMode::Manual, },

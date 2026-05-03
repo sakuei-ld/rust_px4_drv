@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::itedtv_bus::BusOps;
 use crate::rt710::RT710;
 use crate::r850::R850;
+use crate::tc90522::System;
 
 use crate::it930x::{CtrlMsgError, IT930x};
 
@@ -17,13 +18,6 @@ pub enum TunerError
     ChipNotDetected,
     #[error("Invalid state.")]
     InvalidState,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum System
-{
-    ISDB_S,
-    ISDB_T,
 }
 
 // チューナーデバイスの必要なパラメータ
@@ -133,8 +127,8 @@ impl<'a, B: BusOps> Px4Device<'a, B>
         
             let tuner = match system
             {
-                System::ISDB_S => Tuner::RT710(RT710::new(&self.it930x, 2, *addr)),
-                System::ISDB_T => Tuner::R850(R850::new(&self.it930x, 2, *addr)),
+                System::ISDB_S => Tuner::RT710(RT710::new(&self.it930x, 2, *addr, i % 2 == 1)),
+                System::ISDB_T => Tuner::R850(R850::new(&self.it930x, 2, *addr, i % 2 == 1)),
             };
 
             self.px4chrdev.push(
