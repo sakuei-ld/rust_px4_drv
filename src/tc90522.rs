@@ -8,6 +8,22 @@ use crate::{it930x::IT930x, itedtv_bus::BusOps};
 // 同じ定義を使うだけ
 use crate::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType};
 
+// エラー関連 (RT710 および R850 の TunerError は共通のはずなので、共通でアクセスするこちらに保持)
+use thiserror::Error;
+#[derive(Debug, Error)]
+pub enum TunerError {
+    #[error("control message error: {0}")]
+    CtrlMsg(#[from] CtrlMsgError), // CtrlMsgError をラップ
+    #[error("R850 chip not detected.")]
+    ChipNotDetected,
+    #[error("Invalid state.")]
+    InvalidState,
+    #[error("Invalid argument.")]
+    InvalidArgument,
+    #[error("Calibration failed.")]
+    CalibrationFailed,
+}
+
 // いらないのでは？
 #[derive(Clone, Copy, Debug)]
 pub struct I2CAddr(pub u8);
