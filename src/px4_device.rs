@@ -5,7 +5,60 @@ use crate::r850::R850;
 use crate::rt710::RT710;
 use crate::tc90522::{System, TunerError};
 
-use crate::it930x::{CtrlMsgError, IT930x};
+use crate::it930x::{CtrlMsgError, GpioMode, IT930x};
+
+const PX4_DEVICE_TS_SYNC_COUNT: usize = 4;
+const PX4_DEVICE_TS_SYNC_SIZE: usize = 188 * PX4_DEVICE_TS_SYNC_COUNT;
+
+/// px4_device_params.c に相当する設定群
+#[derive(Debug, Clone)]
+pub struct Px4DeviceConfig {
+    pub tsdev_max_packets: u32,
+    pub psb_purge_timeout: i32,
+    pub disable_multi_device_power_control: bool,
+    pub multi_device_power_control_mode: Px4MldevMode,
+    pub s_tuner_no_sleep: bool,
+    pub discard_null_packets: bool,
+}
+
+impl Default for Px4DeviceConfig {
+    fn default() -> Self {
+        Self {
+            tsdev_max_packets: 2048,
+            psb_purge_timeout: 2000,
+            disable_multi_device_power_control: false,
+            multi_device_power_control_mode: Px4MldevMode::All,
+            s_tuner_no_sleep: false,
+            discard_null_packets: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Px4MldevMode {
+    All,
+    SOnly,
+    S0Only,
+    S1Only,
+}
+
+// ストリームコンテキスト
+// TSパケットの同期を管理する。
+struct Px4StreamContext {
+    // 各チャンネルの参照（またはID）を保持
+    // Cの struct ptx_chrdev *chrdev[PX4_CHRDEV_NUM] に相当
+    remain_buf: [u8; PX4_DEVICE_TS_SYNC_SIZE],
+    remain_len: usize,
+}
+
+impl Px4StreamContext {
+    fn new() -> Self {
+        Self {
+            remain_buf: [0u8; PX4_DEVICE_TS_SYNC_SIZE],
+            remain_len: 0,
+        }
+    }
+}
 
 // チューナーデバイスの必要なパラメータ
 // System, TC90522 bus の順
@@ -40,6 +93,15 @@ const TC_INIT_T0: [(u8, u8); 2] = [(0x0e, 0x77), (0x0f, 0x13)];
 pub enum Tuner<'a, B: BusOps> {
     RT710(RT710<'a, B>),
     R850(R850<'a, B>),
+}
+
+impl<'a, B: BusOps> Tuner<'a, B> {
+    pub fn term(&mut self) -> Result<(), TunerError> {
+        match self {
+            Tuner::RT710(t) => t.term(),
+            Tuner::R850(t) => t.term(),
+        }
+    }
 }
 
 pub struct Px4Chrdev<'a, B: BusOps> {
@@ -92,6 +154,22 @@ impl<'a, B: BusOps> Px4Device<'a, B> {
     }
 
     pub fn init(&mut self) -> Result<(), TunerError> {
+        // 各種初期化なども、ここに入れてしまう。
+        // ブリッジ自体の起動
+        self.it930x.raise()?;
+        self.it930x.load_firmware("it930x-firmware.bin")?;
+        self.it930x.init_warm()?;
+
+        // 電源投入
+        self.it930x.set_gpio_mode(7, GpioMode::Out, true)?;
+        self.it930x.set_gpio_mode(2, GpioMode::Out, true)?;
+
+        self.it930x.write_gpio(7, true)?;
+        self.it930x.write_gpio(2, false)?;
+
+        self.it930x.set_gpio_mode(11, GpioMode::Out, true)?;
+        self.it930x.write_gpio(11, false)?;
+
         for (i, (system, addr)) in PX4_CHRDEV_CONFIGS.iter().enumerate() {
             // px4_device.c 1128 行目に chrdev4->tc90522.i2c = &it930x->i2c_master[1]; とあり
             // it930x.c の 571 行目で、priv->i2c[i].bus = i + 1; で、
@@ -126,6 +204,39 @@ impl<'a, B: BusOps> Px4Device<'a, B> {
                 Tuner::R850(t) => t.init()?,
             };
         }
+        Ok(())
+    }
+
+    // memo: await 消したので、tokio いらないかも？
+    // バックエンドの電源状態を制御します (px4_backend_set_power)
+    fn backend_set_power(&self, state: bool) -> Result<(), CtrlMsgError> {
+        // デバッグ出力相当（必要に応じてログライブラリを使用）
+        println!(
+            "px4_backend_set_power: {}",
+            if state { "on" } else { "off" }
+        );
+
+        if state {
+            // 電源 ON シーケンス
+            // GPIO 0 を Low にしてリセット解除 (?)
+            self.it930x.write_regs(0xd8b4, &[0x01])?; // GPIO 0 output enable
+            self.it930x.write_regs(0xd8b3, &[0x00])?; // GPIO 0 output low
+
+            // 10ms 待機
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            // GPIO 0 を High に
+            self.it930x.write_regs(0xd8b3, &[0x01])?; // GPIO 0 output high
+
+            // 10ms 待機
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        } else {
+            // 電源 OFF シーケンス
+            // GPIO 0 を Low にして保持
+            self.it930x.write_regs(0xd8b4, &[0x01])?;
+            self.it930x.write_regs(0xd8b3, &[0x00])?;
+        }
+
         Ok(())
     }
 }
