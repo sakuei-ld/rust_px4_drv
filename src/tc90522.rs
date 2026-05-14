@@ -78,6 +78,15 @@ impl<'a, B: BusOps> TC90522<'a, B> {
         }
     }
 
+    // 明示的な終了処理 (tc90522_term()相当)
+    pub fn term(&mut self) -> Result<(), TunerError>{
+        println!("[info] TC90522 terminating: powering down...");
+
+        // デバイスをスリープ状態にする
+        self.sleep(true)?;
+        Ok(())
+    }
+
     // I2C経由のTC90522レジスタの読み込み (排他制御なし)
     fn read_regs_nolock(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
         if buf.is_empty() {
@@ -445,10 +454,9 @@ impl<'a, B: BusOps> Drop for TC90522<'a, B> {
     fn drop(&mut self) {
         // Cコードの tc90522_term() 相当の処理
         // デバイスをスリープ状態にする
-
-        // すでに実装済みの sleep_s, sleep_t を呼び出す
-        // ※ drop 内でエラーが発生してもパニックさせないよう、結果は無視するかログを出す程度にします
-        println!("[debug] TC90522 dropping: powering down...");
+        // 保険としての終了処理とし、エラーは無視。
+        
+        println!("[info] TC90522 dropping: powering down...");
 
         let _ = self.sleep(true);
         // 最後に LNA (Low Noise Amplifier) などの電源を切る処理があればここに追加

@@ -441,6 +441,30 @@ impl<'a, B: BusOps> RT710<'a, B> {
         Ok(())
     }
 
+    pub fn term(&mut self) -> Result<(), TunerError> {
+        {
+            let mut priv_data = self.priv_.lock().unwrap();
+
+            if !priv_data.init {
+                return Ok(()); // 既に終了済みなら何もしない
+            }
+
+            println!("[rt710] terminating tuner...");
+
+            // 1. 自身のハードウェアをスリープ
+            let _ = self.sleep();
+
+            // 2. 状態をクリア
+            priv_data.init = false;
+            priv_data.freq = 0;
+        }
+
+        // 3. 内包する復調器 (TC90522) の終了処理を連鎖させる
+        self.tc90522.term()?;
+
+        Ok(())
+    }
+
     // チューナーをスリープ状態に移行
     pub fn sleep(&self) -> Result<(), TunerError> {
         let mut priv_data = self.priv_.lock().unwrap();
@@ -769,12 +793,16 @@ impl<'a, B: BusOps> RT710<'a, B> {
 
 impl<'a, B: BusOps> Drop for RT710<'a, B> {
     // インスタンス破棄時に、初期化フラグをリセット
+    // (保険としての終了処理で、エラーは無視)
     fn drop(&mut self) {
         // ロックが取れるなら取ってフラグを下ろす（パニック時はロックが取れない可能性があるので注意）
         if let Ok(mut priv_data) = self.priv_.lock() {
             if priv_data.init {
                 priv_data.init = false;
+                let _ = self.sleep();
                 println!("RT710 dropped and terminated.");
+
+                // メモ: tc90522 は構造体のメンバなので、この後自動的に tc90522 の drop() が呼ばれる。
             }
         }
     }

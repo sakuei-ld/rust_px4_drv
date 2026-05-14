@@ -3595,6 +3595,44 @@ impl<'a, B: BusOps> R850<'a, B> {
         Ok(())
     }
 
+    /// 明示的な終了処理
+    pub fn term(&mut self) -> Result<(), TunerError> {
+        println!("[info] R850 terminating tuner...");
+        {
+            let mut priv_data = self.priv_.lock().unwrap();
+
+            if !priv_data.init {
+                return Ok(()); // 既に終了済みなら何もしない
+            }
+
+            // 1. 自身のハードウェアをスリープ
+            // (R850 の場合は self.sleep() に priv_data が不要な設計になっていますが適宜合わせます)
+            let _ = self.sleep();
+
+            // 2. システム状態を未定義に戻す (R850_SYSTEM_UNDEFINED 相当)
+            priv_data.sys.system = R850System::Undefined;
+            priv_data.sys_curr.system = R850System::Undefined;
+
+            // 3. IMRキャリブレーション完了フラグのリセット
+            priv_data.imr_cal[0].done = false;
+            priv_data.imr_cal[1].done = false;
+
+            // 4. レジスタキャッシュのゼロクリア (memset 相当)
+            priv_data.regs.fill(0);
+
+            // 5. チップ情報のクリア
+            priv_data.chip = 0;
+
+            // 6. 初期化フラグを倒す
+            priv_data.init = false;
+        }
+
+        // 3. 内包する復調器 (TC90522) の終了処理を連鎖させる
+        self.tc90522.term()?;
+
+        Ok(())
+    }
+
     // チューナーをスリープ状態に移行
     pub fn sleep(&self) -> Result<(), TunerError> {
         let mut priv_data = self.priv_.lock().unwrap();
@@ -3757,6 +3795,8 @@ impl<'a, B: BusOps> Drop for R850<'a, B> {
             if !priv_data.init {
                 return;
             }
+
+            let _ = self.sleep();
 
             // 1. システム状態を未定義に戻す (R850_SYSTEM_UNDEFINED 相当)
             priv_data.sys.system = R850System::Undefined;
