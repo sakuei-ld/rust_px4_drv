@@ -1,8 +1,9 @@
-use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
 use crate::itedtv_bus::BusOps;
+use crate::px4_device::Tuner;
 use crate::tc90522::{System, TunerError, TC90522};
 
 const R850_NUM_REGS: usize = 0x30;
@@ -50,6 +51,26 @@ pub const RF_ACC_GAIN: [u16; 16] = [
 pub const MIXER_ACC_GAIN: [u16; 16] = [
     0, 0, 0, 0, 9, 22, 32, 44, 56, 68, 80, 90, 100, 100, 100, 100,
 ];
+
+// px4_device.c の定義を、こっちでしか使わないので移動
+// 地デジ用 (ISDB-T) 初期化パラメータ
+// &[u8] にするために、値の前に `&` をつけ、配列リテラル `[...]` で囲む
+const TC_INIT_T: [(u8, &'static [u8]); 10] = [
+    (0xb0, &[0xa0]),
+    (0xb2, &[0x3d]),
+    (0xb3, &[0x25]),
+    (0xb4, &[0x8b]),
+    (0xb5, &[0x4b]),
+    (0xb6, &[0x3f]),
+    (0xb7, &[0xff]),
+    (0xb8, &[0xc0]),
+    (0x1f, &[0x00]),
+    (0x75, &[0x00]),
+];
+
+// px4_device.c の定義を、こっちでしか使わないので移動
+// デバイス全体の初期化用 (地デジ)
+const TC_INIT_T0: [(u8, &'static [u8]); 2] = [(0x0e, &[0x77]), (0x0f, &[0x13])];
 
 // 設定
 #[derive(Debug, Clone, Copy)]
@@ -2044,11 +2065,12 @@ pub struct R850<'a, B: BusOps> {
 
     pub i2c_addr: u8,
     priv_: Mutex<R850Priv>,
+    is_initialized: AtomicBool,
 }
 
 impl<'a, B: BusOps> R850<'a, B> {
     // bit反転
-    pub fn reverse_bit(val: u8) -> u8 {
+    fn reverse_bit(val: u8) -> u8 {
         let mut t = val;
 
         t = ((t & 0x55) << 1) | ((t & 0xAA) >> 1);
@@ -2057,7 +2079,7 @@ impl<'a, B: BusOps> R850<'a, B> {
     }
 
     // レジスタ読み取り
-    pub fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
+    fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
         if (buf.len() == 0) || (buf.len() > (R850_NUM_REGS - reg as usize)) {
             return Err(CtrlMsgError::InvalidLength);
         }
@@ -2090,7 +2112,7 @@ impl<'a, B: BusOps> R850<'a, B> {
     }
 
     // レジスタ書き込み
-    pub fn write_regs(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
+    fn write_regs(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
         if (buf.len() == 0) || (buf.len() > (R850_NUM_REGS - reg as usize)) {
             return Err(CtrlMsgError::InvalidLength);
         }
@@ -2109,7 +2131,7 @@ impl<'a, B: BusOps> R850<'a, B> {
     }
 
     // メモ: 初期値(デフォルト値)に戻すイメージ
-    pub fn init_regs(&self, priv_data: &mut R850Priv) {
+    fn init_regs(&self, priv_data: &mut R850Priv) {
         //let mut priv_data = self.priv_.lock().unwrap();
         priv_data.regs.copy_from_slice(&INIT_REGS);
     }
@@ -3466,15 +3488,20 @@ impl<'a, B: BusOps> R850<'a, B> {
         tc90522_bus: u8,
         tc90522_addr: u8,
         is_secondary: bool,
-    ) -> Self {
-        Self {
-            tc90522: TC90522::new(
-                it930x,
-                tc90522_bus,
-                tc90522_addr,
-                System::ISDB_T,
-                is_secondary,
-            ),
+    ) -> Result<Self, TunerError> {
+        let tc90522 = TC90522::new(
+            it930x,
+            tc90522_bus,
+            tc90522_addr,
+            System::ISDB_T,
+            is_secondary,
+        );
+
+        // 生成された直後に、この論理コアをスリープ状態にする
+        tc90522.sleep(true)?;
+
+        Ok(Self {
+            tc90522,
             i2c_addr: 0x7c,
 
             config: R850Config {
@@ -3529,113 +3556,13 @@ impl<'a, B: BusOps> R850<'a, B> {
                 mixer_mode: 0,
                 mixer_amp_lpf_imr_cal: 0,
             }),
-        }
-    }
-
-    // 初期化処理
-    pub fn init(&self) -> Result<(), TunerError> {
-        // 初期状態の設定
-        let mut priv_data = self.priv_.lock().unwrap();
-
-        priv_data.init = false;
-
-        priv_data.chip = 0;
-        priv_data.sleep = false;
-
-        priv_data.sys.system = R850System::Undefined;
-
-        priv_data.sys_curr.system = R850System::Undefined;
-
-        // なんか、Cコードとは別に、他の箇所の初期値を設定している。
-        for cal in priv_data.imr_cal.iter_mut() {
-            cal.done = false;
-            cal.result = [false; 5];
-            cal.mixer_amp_lpf = 0;
-            for imr in cal.imr.iter_mut() {
-                *imr = R850Imr {
-                    gain: 0,
-                    phase: 0,
-                    iqcap: 0,
-                    value: 0,
-                };
-            }
-        }
-
-        // チップ判定
-        let mut detected = false;
-        for _ in 0..4 {
-            let mut tmp = [0u8];
-            if self.read_regs(0x00, &mut tmp).is_ok() {
-                if (tmp[0] & 0x98) != 0 {
-                    priv_data.chip = 1;
-                    detected = true;
-                    break;
-                }
-            }
-        }
-
-        if !detected {
-            return Err(TunerError::ChipNotDetected);
-        }
-
-        // レジスタ初期化
-        let mut regs = [0u8; R850_NUM_REGS - 0x08];
-        self.read_regs(0x08, &mut regs)?;
-
-        // check xtal power
-        self.check_xtal_power(&mut priv_data)?;
-
-        self.write_regs(0x08, &regs)?;
-
-        // init regs
-        self.init_regs(&mut priv_data);
-
-        priv_data.init = true;
-
-        Ok(())
-    }
-
-    /// 明示的な終了処理
-    pub fn term(&mut self) -> Result<(), TunerError> {
-        println!("[info] R850 terminating tuner...");
-        {
-            let mut priv_data = self.priv_.lock().unwrap();
-
-            if !priv_data.init {
-                return Ok(()); // 既に終了済みなら何もしない
-            }
-
-            // 1. 自身のハードウェアをスリープ
-            // (R850 の場合は self.sleep() に priv_data が不要な設計になっていますが適宜合わせます)
-            let _ = self.sleep();
-
-            // 2. システム状態を未定義に戻す (R850_SYSTEM_UNDEFINED 相当)
-            priv_data.sys.system = R850System::Undefined;
-            priv_data.sys_curr.system = R850System::Undefined;
-
-            // 3. IMRキャリブレーション完了フラグのリセット
-            priv_data.imr_cal[0].done = false;
-            priv_data.imr_cal[1].done = false;
-
-            // 4. レジスタキャッシュのゼロクリア (memset 相当)
-            priv_data.regs.fill(0);
-
-            // 5. チップ情報のクリア
-            priv_data.chip = 0;
-
-            // 6. 初期化フラグを倒す
-            priv_data.init = false;
-        }
-
-        // 3. 内包する復調器 (TC90522) の終了処理を連鎖させる
-        self.tc90522.term()?;
-
-        Ok(())
+            is_initialized: AtomicBool::new(false),
+        })
     }
 
     // チューナーをスリープ状態に移行
-    pub fn sleep(&self) -> Result<(), TunerError> {
-        let mut priv_data = self.priv_.lock().unwrap();
+    fn sleep(&self, priv_data: &mut R850Priv) -> Result<(), TunerError> {
+        //let mut priv_data = self.priv_.lock().unwrap();
 
         if !priv_data.init {
             return Err(TunerError::InvalidState);
@@ -3784,6 +3711,164 @@ impl<'a, B: BusOps> R850<'a, B> {
     }
 }
 
+impl<'a, B: BusOps> Tuner for R850<'a, B> {
+    // 初期化処理
+    fn init(&mut self) -> Result<(), TunerError> {
+        // 初期状態の設定
+        let mut priv_data = self.priv_.lock().unwrap();
+
+        priv_data.init = false;
+
+        priv_data.chip = 0;
+        priv_data.sleep = false;
+
+        priv_data.sys.system = R850System::Undefined;
+
+        priv_data.sys_curr.system = R850System::Undefined;
+
+        // なんか、Cコードとは別に、他の箇所の初期値を設定している。
+        for cal in priv_data.imr_cal.iter_mut() {
+            cal.done = false;
+            cal.result = [false; 5];
+            cal.mixer_amp_lpf = 0;
+            for imr in cal.imr.iter_mut() {
+                *imr = R850Imr {
+                    gain: 0,
+                    phase: 0,
+                    iqcap: 0,
+                    value: 0,
+                };
+            }
+        }
+
+        // チップ判定
+        let mut detected = false;
+        for _ in 0..4 {
+            let mut tmp = [0u8];
+            if self.read_regs(0x00, &mut tmp).is_ok() {
+                if (tmp[0] & 0x98) != 0 {
+                    priv_data.chip = 1;
+                    detected = true;
+                    break;
+                }
+            }
+        }
+
+        if !detected {
+            return Err(TunerError::ChipNotDetected);
+        }
+
+        // レジスタ初期化
+        let mut regs = [0u8; R850_NUM_REGS - 0x08];
+        self.read_regs(0x08, &mut regs)?;
+
+        // check xtal power
+        self.check_xtal_power(&mut priv_data)?;
+
+        self.write_regs(0x08, &regs)?;
+
+        // init regs
+        self.init_regs(&mut priv_data);
+
+        priv_data.init = true;
+
+        Ok(())
+    }
+
+    // デバイスの利用を開始する
+    // px4_device.c の一部の機能を切り出し
+    fn open(&self) -> Result<(), TunerError> {
+        // 1. 個別ウェイクアップレジスタ (tc_init_t) の書き込み
+        self.tc90522.write_multiple_regs(&TC_INIT_T)?;
+
+        // 2. TSピンの無効化
+        self.tc90522.enable_ts_pins(false)?;
+
+        // 3. 復調器のスリープ解除
+        self.tc90522.sleep(false)?;
+
+        // 4. R850 チューナーチップ自身のウェイクアップ (Cコードの r850_wakeup 相当)
+        self.wakeup()?;
+
+        // 5. 初期システム・帯域・IF周波数の設定 (Cコードの r850_set_system 相当)
+        // Cコード: sys.system = R850_SYSTEM_ISDB_T; sys.bandwidth = R850_BANDWIDTH_6M; sys.if_freq = 4063;
+        let sytem_config = R850SystemConfig {
+            system: R850System::IsdbT,
+            bandwidth: R850Bandwidth::B6M,
+            if_freq: 4063,
+        };
+        self.set_system(sytem_config)?;
+
+        Ok(())
+    }
+
+    // デバイスの利用を終了する
+    // px4_device.c の一部の機能を切り出し
+    fn close(&self) -> Result<(), TunerError> {
+        let mut priv_data = self.priv_.lock().unwrap();
+
+        // 逆の順序で終了させる
+        // 1. チューナー自身をスリープ
+        self.sleep(&mut priv_data)?;
+
+        // 2. 復調器の TS出力 を無効化
+        self.tc90522.enable_ts_pins(false)?;
+
+        // 3. 復調器をスリープ
+        self.tc90522.sleep(true)?;
+
+        println!("[R850] Device closed and put to sleep.");
+        Ok(())
+    }
+
+    fn init_0(&self) -> Result<(), TunerError> {
+        // px4_device.c のコードの一部を切り出して、R850の役割として貼り付け
+        // 492行目の処理で、Tuner の オープン1個目のときに走らせる。
+        println!("[R850] Performing global demodulator initialization (T0)...");
+        self.tc90522.write_multiple_regs(&TC_INIT_T0)?;
+        Ok(())
+    }
+
+    /// 明示的な終了処理
+    fn term(&mut self) -> Result<(), TunerError> {
+        println!("[info] R850 terminating tuner...");
+        {
+            // Mutexをロックして内部データにアクセスします。
+            // 既に他のスレッドでパニックが発生してポイズニングされている可能性を考慮し、
+            // if let で安全にロックを取得します。
+            if let Ok(mut priv_data) = self.priv_.lock() {
+                // 初期化されていない場合はクリーンアップ不要
+                if !priv_data.init {
+                    return Ok(());
+                }
+
+                let _ = self.sleep(&mut priv_data);
+
+                // 1. システム状態を未定義に戻す (R850_SYSTEM_UNDEFINED 相当)
+                priv_data.sys.system = R850System::Undefined;
+                priv_data.sys_curr.system = R850System::Undefined;
+
+                // 2. IMRキャリブレーション完了フラグのリセット
+                priv_data.imr_cal[0].done = false;
+                priv_data.imr_cal[1].done = false;
+
+                // 3. レジスタキャッシュのゼロクリア (memset 相当)
+                priv_data.regs.fill(0);
+
+                // 4. チップ情報のクリア
+                priv_data.chip = 0;
+
+                // 5. 初期化フラグを倒す
+                priv_data.init = false;
+            }
+        }
+        // 3. 内包する復調器 (TC90522) の終了処理を連鎖させる
+        self.tc90522.term()?;
+
+        Ok(())
+    }
+}
+
 impl<'a, B: BusOps> Drop for R850<'a, B> {
     // インスタンス破棄時に、内部状態をクリア
     fn drop(&mut self) {
@@ -3796,7 +3881,7 @@ impl<'a, B: BusOps> Drop for R850<'a, B> {
                 return;
             }
 
-            let _ = self.sleep();
+            let _ = self.sleep(&mut priv_data);
 
             // 1. システム状態を未定義に戻す (R850_SYSTEM_UNDEFINED 相当)
             priv_data.sys.system = R850System::Undefined;

@@ -1,9 +1,9 @@
-// ここからは RT710の話
-
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
 use crate::itedtv_bus::BusOps;
+use crate::px4_device::Tuner;
 use crate::tc90522::{System, TunerError, TC90522};
 
 const NUM_REGS: usize = 0x10;
@@ -28,6 +28,14 @@ const RT720_LNA_ACC_GAIN: [i32; 32] = [
     0, 27, 53, 81, 109, 134, 156, 176, 194, 202, 211, 221, 232, 245, 258, 271, 285, 307, 326, 341,
     357, 374, 393, 410, 428, 439, 445, 470, 476, 479, 495, 507,
 ];
+
+// px4_device.c の定義を、こっちでしか使わないので移動
+// BS/CS用 (ISDB-S) 初期化パラメータ
+const TC_INIT_S: [(u8, &'static [u8]); 3] = [(0x15, &[0x00]), (0x1d, &[0x00]), (0x04, &[0x02])];
+
+// px4_device.c の定義を、こっちでしか使わないので移動
+// デバイス全体の初期化用 (BS/CS)
+const TC_INIT_S0: [(u8, &'static [u8]); 2] = [(0x07, &[0x31]), (0x08, &[0x77])];
 
 #[derive(Default, Clone, Copy)]
 struct BandwidthParam {
@@ -191,6 +199,7 @@ pub struct RT710<'a, B: BusOps> {
     pub i2c_addr: u8,
     config: RT710Config,
     priv_: Mutex<RT710Priv>,
+    is_initialized: AtomicBool,
 }
 
 impl<'a, B: BusOps> RT710<'a, B> {
@@ -204,7 +213,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
     }
 
     // レジストリ読み取り
-    pub fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
+    fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
         if (buf.len() == 0) || (buf.len() > NUM_REGS - reg as usize) {
             return Err(CtrlMsgError::InvalidLength);
         }
@@ -237,7 +246,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
     }
 
     // レジストリ書き込み
-    pub fn write_regs(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
+    fn write_regs(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
         if (buf.len() == 0) || (buf.len() > (NUM_REGS - reg as usize)) {
             return Err(CtrlMsgError::InvalidLength);
         }
@@ -378,15 +387,20 @@ impl<'a, B: BusOps> RT710<'a, B> {
         tc90522_bus: u8,
         tc90522_addr: u8,
         is_secondary: bool,
-    ) -> Self {
-        Self {
-            tc90522: TC90522::new(
-                it930x,
-                tc90522_bus,
-                tc90522_addr,
-                System::ISDB_S,
-                is_secondary,
-            ),
+    ) -> Result<Self, TunerError> {
+        let tc90522 = TC90522::new(
+            it930x,
+            tc90522_bus,
+            tc90522_addr,
+            System::ISDB_S,
+            is_secondary,
+        );
+
+        // 生成された直後に、この論理コアをスリープ状態にする
+        tc90522.sleep(true)?;
+
+        Ok(Self {
+            tc90522,
             i2c_addr: 0x7a, // 決まっているので
             // px4_device.c の 1134〜1144行目
             config: RT710Config {
@@ -405,69 +419,13 @@ impl<'a, B: BusOps> RT710<'a, B> {
                 freq: 0,
                 chip: RT710ChipType::RT710,
             }),
-        }
-    }
-
-    // チューナー初期化
-    pub fn init(&mut self) -> Result<(), TunerError> {
-        let mut chip_type = RT710ChipType::UNKNOWN;
-        let mut tmp = [0u8; 1];
-        {
-            //let _lock = self.priv_.lock.lock().unwrap();
-            let mut priv_data = self.priv_.lock().unwrap();
-
-            priv_data.init = false;
-            priv_data.freq = 0;
-
-            self.read_regs(0x03, &mut tmp)?;
-
-            priv_data.chip = if (tmp[0] & 0xf0) == 0x70 {
-                RT710ChipType::RT710
-            } else {
-                RT710ChipType::RT720
-            };
-
-            priv_data.init = true;
-
-            // debug用
-            chip_type = priv_data.chip
-        }
-
-        // いらないのでは？
-        println!(
-            "RT710 init done. chip: {:?}, reg03=0x{:02x}",
-            chip_type, tmp[0]
-        );
-        Ok(())
-    }
-
-    pub fn term(&mut self) -> Result<(), TunerError> {
-        {
-            let mut priv_data = self.priv_.lock().unwrap();
-
-            if !priv_data.init {
-                return Ok(()); // 既に終了済みなら何もしない
-            }
-
-            println!("[rt710] terminating tuner...");
-
-            // 1. 自身のハードウェアをスリープ
-            let _ = self.sleep();
-
-            // 2. 状態をクリア
-            priv_data.init = false;
-            priv_data.freq = 0;
-        }
-
-        // 3. 内包する復調器 (TC90522) の終了処理を連鎖させる
-        self.tc90522.term()?;
-
-        Ok(())
+            is_initialized: AtomicBool::new(false),
+        })
     }
 
     // チューナーをスリープ状態に移行
-    pub fn sleep(&self) -> Result<(), TunerError> {
-        let mut priv_data = self.priv_.lock().unwrap();
+    fn sleep(&self, priv_data: &RT710Priv) -> Result<(), TunerError> {
+        //let mut priv_data = self.priv_.lock().unwrap();
 
         if !priv_data.init {
             return Err(TunerError::InvalidState);
@@ -791,6 +749,108 @@ impl<'a, B: BusOps> RT710<'a, B> {
     }
 }
 
+impl<'a, B: BusOps> Tuner for RT710<'a, B> {
+    // チューナー初期化
+    fn init(&mut self) -> Result<(), TunerError> {
+        let mut chip_type = RT710ChipType::UNKNOWN;
+        let mut tmp = [0u8; 1];
+        {
+            //let _lock = self.priv_.lock.lock().unwrap();
+            let mut priv_data = self.priv_.lock().unwrap();
+
+            priv_data.init = false;
+            priv_data.freq = 0;
+
+            self.read_regs(0x03, &mut tmp)?;
+
+            priv_data.chip = if (tmp[0] & 0xf0) == 0x70 {
+                RT710ChipType::RT710
+            } else {
+                RT710ChipType::RT720
+            };
+
+            priv_data.init = true;
+
+            // debug用
+            chip_type = priv_data.chip
+        }
+
+        // いらないのでは？
+        println!(
+            "RT710 init done. chip: {:?}, reg03=0x{:02x}",
+            chip_type, tmp[0]
+        );
+        Ok(())
+    }
+
+    // デバイスの利用を開始する
+    // px4_device.c の一部の機能を切り出し
+    fn open(&self) -> Result<(), TunerError> {
+        // 1. 個別ウェイクアップレジスタ (tc_init_s) の書き込み
+        self.tc90522.write_multiple_regs(&TC_INIT_S)?;
+
+        // 2. 復調器の TS出力 を無効化
+        self.tc90522.enable_ts_pins(false)?;
+
+        // 3. 復調器のスリープを解除
+        self.tc90522.sleep(false)?;
+
+        println!("[RT710] Device opened and awakened successfully.");
+        Ok(())
+    }
+
+    // デバイスの利用を終了する
+    // px4_device.c の一部の機能を切り出し
+    fn close(&self) -> Result<(), TunerError> {
+        let priv_data = self.priv_.lock().unwrap();
+
+        // 逆の順序で終了させる
+        // 1. チューナー自身をスリープ
+        self.sleep(&*priv_data)?;
+
+        // 2. 復調器の TS出力 を無効化
+        self.tc90522.enable_ts_pins(false)?;
+
+        // 3. 復調器をスリープ
+        self.tc90522.sleep(true)?;
+
+        println!("[R850] Device closed and put to sleep.");
+        Ok(())
+    }
+
+    fn init_0(&self) -> Result<(), TunerError> {
+        // px4_device.c のコードの一部を切り出して、RT710の役割として貼り付け
+        // 481行目の処理で、Tuner の オープン1個目のときに走らせる。
+        println!("[RT710] Performing global demodulator initialization (S0)...");
+        self.tc90522.write_multiple_regs(&TC_INIT_S0)?;
+        Ok(())
+    }
+
+    fn term(&mut self) -> Result<(), TunerError> {
+        {
+            let mut priv_data = self.priv_.lock().unwrap();
+
+            if !priv_data.init {
+                return Ok(()); // 既に終了済みなら何もしない
+            }
+
+            println!("[rt710] terminating tuner...");
+
+            // 1. 自身のハードウェアをスリープ
+            let _ = self.sleep(&*priv_data);
+
+            // 2. 状態をクリア
+            priv_data.init = false;
+            priv_data.freq = 0;
+        }
+
+        // 3. 内包する復調器 (TC90522) の終了処理を連鎖させる
+        self.tc90522.term()?;
+
+        Ok(())
+    }
+}
+
 impl<'a, B: BusOps> Drop for RT710<'a, B> {
     // インスタンス破棄時に、初期化フラグをリセット
     // (保険としての終了処理で、エラーは無視)
@@ -799,7 +859,8 @@ impl<'a, B: BusOps> Drop for RT710<'a, B> {
         if let Ok(mut priv_data) = self.priv_.lock() {
             if priv_data.init {
                 priv_data.init = false;
-                let _ = self.sleep();
+                priv_data.freq = 0;
+                let _ = self.sleep(&*priv_data);
                 println!("RT710 dropped and terminated.");
 
                 // メモ: tc90522 は構造体のメンバなので、この後自動的に tc90522 の drop() が呼ばれる。

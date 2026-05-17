@@ -1,3 +1,4 @@
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 use crate::itedtv_bus::BusOps;
@@ -43,7 +44,8 @@ pub enum Px4MldevMode {
 }
 
 // ストリームコンテキスト
-// TSパケットの同期を管理する。
+// TSパケットの同期を管理する。(構造を変えたので、ここは削除予定)
+/*
 struct Px4StreamContext {
     // 各チャンネルの参照（またはID）を保持
     // Cの struct ptx_chrdev *chrdev[PX4_CHRDEV_NUM] に相当
@@ -59,6 +61,83 @@ impl Px4StreamContext {
         }
     }
 }
+*/
+
+/// remain_len などの複雑なフラグ制御を完全に排除し、Rust 向けに最適化したプロセス関数
+fn px4_device_stream_process(chrdevs: &mut [Px4Chrdev], buf: &mut [u8]) -> usize {
+    let mut offset = 0;
+
+    // 4パケット分の同期チェックを行うため、最低でも 752 バイト残っている間ループする
+    while offset + PX4_DEVICE_TS_SYNC_SIZE <= buf.len() {
+        let mut is_synced = true;
+
+        // 4パケット連続で同期パターン (xxxx 0111) が一致するかチェック
+        for i in 0..PX4_DEVICE_TS_SYNC_COUNT {
+            if (buf[offset + i * 188] & 0x8f) != 0x07 {
+                is_synced = false;
+                break;
+            }
+        }
+
+        // 同期が確認できなかった場合、1バイト進めてリトライ (Cコードの p++ 相当)
+        if !is_synced {
+            offset += 1;
+            continue;
+        }
+
+        // 同期が取れたあと、ここから188バイト単位で処理可能な限りパケットを切り出す
+        while offset + 188 <= buf.len() && (buf[offset] & 0x8f) == 0x07 {
+            // パケットヘッダからポートID (1〜4) を抽出
+            let id = (buf[offset] & 0x70) >> 4;
+
+            if id > 0 && id < 5 {
+                // 同期バイトを通常の MPEG-2 TS 規格である 0x47 に書き換える
+                buf[offset] = 0x47;
+
+                let packet = &buf[offset..offset + 188];
+
+                // 該当するポートIDを持つ Px4Chrdev を探してデータを配信
+                if let Some(chrdev) = chrdevs.iter().find(|c| c.port_number == id) {
+                    // 既存のメソッドを呼び出すだけで安全に送信されます
+                    chrdev.put_stream(packet);
+                }
+            }
+
+            offset += 188;
+        }
+    }
+
+    // 消費した（次回への持ち越しが不要な）バイト数を親に返す
+    offset
+}
+
+struct Px4StreamContext<'a> {
+    pub chrdevs: Vec<Px4Chrdev<'a>>,
+    // 柔軟に伸縮する動的バッファ
+    pub buffer: Vec<u8>,
+}
+
+impl<'a> Px4StreamContext<'a> {
+    pub fn new(chrdevs: Vec<Px4Chrdev<'a>>) -> Self {
+        Self {
+            chrdevs,
+            // 予めある程度の容量を確保しておくことで、再アロケーションのオーバーヘッドをゼロにできます
+            buffer: Vec::with_capacity(1024 * 64),
+        }
+    }
+
+    /// ユーザー空間向けの非常にシンプルなストリームハンドラ
+    pub fn handle_stream(&mut self, new_data: &[u8]) {
+        // 1. 新しく届いたデータをバッファの後方にそのまま結合
+        self.buffer.extend_from_slice(new_data);
+
+        // 2. 結合されたバッファ全体に対してスキャンを実行
+        let consumed = px4_device_stream_process(&mut self.chrdevs, &mut self.buffer);
+
+        // 3. 処理が完了した分のデータをバッファの先頭から削除し、残差を前方に詰める
+        self.buffer.drain(0..consumed);
+    }
+}
 
 // チューナーデバイスの必要なパラメータ
 // System, TC90522 bus の順
@@ -71,6 +150,7 @@ const PX4_CHRDEV_CONFIGS: [(System, u8); 4] = [
     (System::ISDB_T, 0x12),
 ];
 
+/*
 // チューナーが開かれる際に、それぞれの復調器に書き込むパラメータ(らしい)
 const TC_INIT_T: [(u8, u8); 10] = [
     (0xb0, 0xa0),
@@ -89,7 +169,10 @@ const TC_INIT_S: [(u8, u8); 3] = [(0x15, 0x00), (0x1d, 0x00), (0x04, 0x02)];
 // デバイス全体の初期化用
 const TC_INIT_S0: [(u8, u8); 2] = [(0x07, 0x31), (0x08, 0x77)];
 const TC_INIT_T0: [(u8, u8); 2] = [(0x0e, 0x77), (0x0f, 0x13)];
+*/
 
+// Tuner を Trait にするために一旦削除
+/*
 pub enum Tuner<'a, B: BusOps> {
     RT710(RT710<'a, B>),
     R850(R850<'a, B>),
@@ -103,8 +186,22 @@ impl<'a, B: BusOps> Tuner<'a, B> {
         }
     }
 }
+    */
 
-pub struct Px4Chrdev<'a, B: BusOps> {
+pub trait Tuner {
+    // チューナー初期化
+    fn init(&mut self) -> Result<(), TunerError>;
+    // S0/T0初期化用
+    fn init_0(&self) -> Result<(), TunerError>;
+    fn open(&self) -> Result<(), TunerError>;
+    fn close(&self) -> Result<(), TunerError>;
+
+    // 論理的な終了処理
+    // 各チューナーチップが「電源が落とされた」ことを認識し、内部状態をリセットするためのメソッド
+    fn term(&mut self) -> Result<(), TunerError>;
+}
+
+pub struct Px4Chrdev<'a> {
     pub system: System,
 
     // ここ3つは要らない気がする。
@@ -113,24 +210,120 @@ pub struct Px4Chrdev<'a, B: BusOps> {
     pub slave_number: u8,
     pub sync_byte: u8,
 
+    // アプリケーション層へデータを送るためのキュー
+    pub tx: Sender<Vec<u8>>,
+
     //pub tc90522: &'a TC90522<'a, B>,
-    pub tuner: Tuner<'a, B>,
+    pub tuner: Box<dyn Tuner + Send + 'a>,
+
+    // オープン状態かのフラグ
+    pub is_opened: bool,
+
+    // LNB給電中かどうかのフラグ
+    pub lnb_power: bool,
 }
 
-pub struct Px4Device<'a, B: BusOps> {
-    it930x: &'a IT930x<B>,
-    px4chrdev: Vec<Px4Chrdev<'a, B>>,
-}
-
-impl<'a, B: BusOps> Px4Device<'a, B> {
-    pub fn new(it930x: &'a IT930x<B>) -> Self {
-        Self {
-            it930x: it930x,
-            px4chrdev: Vec::new(),
-        }
+impl<'a> Px4Chrdev<'a> {
+    /// 188バイトのTSパケットを配信する
+    pub fn put_stream(&self, packet: &[u8]) {
+        // チャンネルが生きている場合のみ送信（エラーは無視、またはログ出力）
+        let _ = self.tx.send(packet.to_vec());
     }
 
-    pub fn set_power(&mut self, state: bool) -> Result<(), CtrlMsgError> {
+    pub fn open(&mut self) -> Result<(), TunerError> {
+        println!("[px4] Opening port {}...", self.port_number);
+
+        // 2. トレイトオブジェクト経由でチューナーを開く
+        self.tuner.open()?;
+
+        // 3. USBブリッジ（IT930x）側のストリーミングを開始（必要に応じて実装）
+        // self.it930x.start_stream(self.port_number)?;
+
+        Ok(())
+    }
+}
+
+pub struct Px4Device<'a, B: BusOps + Sync> {
+    it930x: &'a IT930x<B>,
+    px4chrdev: Vec<Px4Chrdev<'a>>,
+
+    open_count: usize,
+    lnb_power_count: usize,
+}
+
+impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
+    pub fn new(it930x: &'a IT930x<B>) -> Result<(Self, Vec<Receiver<Vec<u8>>>), TunerError> {
+        // px4_device_init() の処理
+        // it930x.raise 以前は、it930x 生成時に走る(ハズ)
+        // ブリッジ自体の起動
+        it930x.raise()?;
+        it930x.load_firmware("it930x-firmware.bin")?;
+        it930x.init_warm()?;
+
+        // 電源投入
+        it930x.set_gpio_mode(7, GpioMode::Out, true)?;
+        it930x.set_gpio_mode(2, GpioMode::Out, true)?;
+
+        it930x.write_gpio(7, true)?;
+        it930x.write_gpio(2, false)?;
+
+        it930x.set_gpio_mode(11, GpioMode::Out, true)?;
+        it930x.write_gpio(11, false)?;
+
+        // px4_backend_init() の処理 (tc90522 の init の部分) + Rust 向けに拡張
+        // Tuner をラップした chrdev の Vec
+        let mut px4chrdev = Vec::new();
+
+        // アプリケーション側に引き渡すレシーバーを格納するVec
+        let mut receivers = Vec::new();
+
+        for (i, (system, addr)) in PX4_CHRDEV_CONFIGS.iter().enumerate() {
+            // px4_device.c 1128 行目に chrdev4->tc90522.i2c = &it930x->i2c_master[1]; とあり
+            // it930x.c の 571 行目で、priv->i2c[i].bus = i + 1; で、
+            // it930x.c の 575 行目で、it930x->i2c_master[i].priv = &priv->i2c[i] とあるので、
+            // bus 番号は 2 で固定。
+            // -> px4 device の場合の話っぽい。
+            //  -> pxmlt device の場合は、&it930x->i2c_master[input->i2c_bus - 1]; みたいになってる。
+            //  -> s1ur や m1ur は [2] なので bus 番号は 3 らしい。
+            // あと、CHRDEV ごとにアドレスが違くて、0x10〜0x13。
+            //let tc90522 = TC90522::new(&it930x, 2, *addr);
+            //tc90522s.push(tc90522);
+
+            // 1. Tuner構造体を作成
+            let mut tuner_box: Box<dyn Tuner + Send> = match system {
+                System::ISDB_S => Box::new(RT710::new(&it930x, 2, *addr, i % 2 == 1)?),
+                System::ISDB_T => Box::new(R850::new(&it930x, 2, *addr, i % 2 == 1)?),
+            };
+
+            // ここでチャンネル(送信・受信のペア)を生成
+            let (tx, rx) = channel();
+            // 受信側 (rx) はリストに保存して最後に init の戻り値として返す
+            receivers.push(rx);
+
+            px4chrdev.push(Px4Chrdev {
+                system: *system,
+                port_number: i as u8 + 1,
+                slave_number: i as u8,
+                sync_byte: ((i as u8 + 1) << 4) | 0x07,
+                tx,
+                tuner: tuner_box,
+                is_opened: false,
+                lnb_power: false,
+            });
+        }
+
+        let device = Self {
+            it930x,
+            px4chrdev,
+            open_count: 0,
+            lnb_power_count: 0,
+        };
+
+        Ok((device, receivers))
+    }
+
+    // px4_device.c px4_backend_set_power() の移植
+    fn backend_set_power(&mut self, state: bool) -> Result<(), CtrlMsgError> {
         println!(
             "[px4] backend_set_power: {}",
             if state { "true" } else { "false" }
@@ -153,90 +346,153 @@ impl<'a, B: BusOps> Px4Device<'a, B> {
         Ok(())
     }
 
-    pub fn init(&mut self) -> Result<(), TunerError> {
-        // 各種初期化なども、ここに入れてしまう。
-        // ブリッジ自体の起動
-        self.it930x.raise()?;
-        self.it930x.load_firmware("it930x-firmware.bin")?;
-        self.it930x.init_warm()?;
-
-        // 電源投入
-        self.it930x.set_gpio_mode(7, GpioMode::Out, true)?;
-        self.it930x.set_gpio_mode(2, GpioMode::Out, true)?;
-
-        self.it930x.write_gpio(7, true)?;
-        self.it930x.write_gpio(2, false)?;
-
-        self.it930x.set_gpio_mode(11, GpioMode::Out, true)?;
-        self.it930x.write_gpio(11, false)?;
-
-        for (i, (system, addr)) in PX4_CHRDEV_CONFIGS.iter().enumerate() {
-            // px4_device.c 1128 行目に chrdev4->tc90522.i2c = &it930x->i2c_master[1]; とあり
-            // it930x.c の 571 行目で、priv->i2c[i].bus = i + 1; で、
-            // it930x.c の 575 行目で、it930x->i2c_master[i].priv = &priv->i2c[i] とあるので、
-            // bus 番号は 2 で固定。
-            // -> px4 device の場合の話っぽい。
-            //  -> pxmlt device の場合は、&it930x->i2c_master[input->i2c_bus - 1]; みたいになってる。
-            //  -> s1ur や m1ur は [2] なので bus 番号は 3 らしい。
-            // あと、CHRDEV ごとにアドレスが違くて、0x10〜0x13。
-            //let tc90522 = TC90522::new(&it930x, 2, *addr);
-            //tc90522s.push(tc90522);
-
-            let tuner = match system {
-                System::ISDB_S => Tuner::RT710(RT710::new(&self.it930x, 2, *addr, i % 2 == 1)),
-                System::ISDB_T => Tuner::R850(R850::new(&self.it930x, 2, *addr, i % 2 == 1)),
-            };
-
-            self.px4chrdev.push(Px4Chrdev {
-                system: *system,
-                port_number: i as u8 + 1,
-                slave_number: i as u8,
-                sync_byte: ((i as u8 + 1) << 4) | 0x07,
-                tuner: tuner,
-            });
+    // BS/CSアンテナ用のLNB給電設定 ... チューナー外なので、Px4Device で管理。
+    fn set_lnb_voltage(&mut self, target_idx: usize, voltage: i32) -> Result<(), TunerError> {
+        // 一応、ISDB-T はスルーするようにしておく
+        if self.px4chrdev[target_idx].system == System::ISDB_T {
+            return Ok(());
         }
 
-        for chrdev in &mut self.px4chrdev {
-            //chrdev.tc90522.init();
-
-            let result = match &mut chrdev.tuner {
-                Tuner::RT710(t) => t.init()?,
-                Tuner::R850(t) => t.init()?,
-            };
+        // 1. バリデーション (0V か 15V 以外は無効)
+        if voltage != 0 && voltage != 15 {
+            return Err(TunerError::InvalidArgument);
         }
+
+        let is_on = voltage == 15;
+
+        // 2. 既に要求された状態と同じなら何もしない
+        if self.px4chrdev[target_idx].lnb_power == is_on {
+            return Ok(());
+        }
+
+        // Cコードの !voltage && !atomic_read(&px4->available) の条件は、
+        // ユーザスペースドライバとしてデバイスオブジェクトが生きていれば不要なため省略します。
+
+        if !is_on {
+            // ---- OFF にする処理 ----
+            if self.lnb_power_count > 0 {
+                self.lnb_power_count -= 1;
+            }
+
+            // 誰もLNB電源を必要としなくなった場合、GPIO 11 を LOW に落とす
+            if self.lnb_power_count == 0 {
+                // Cコードの挙動を再現：OFFにする際のエラーはログ出力に留め、状態の更新を優先する
+                if let Err(e) = self.it930x.write_gpio(11, false) {
+                    println!("[warn] Failed to turn off LNB GPIO 11: {:?}", e);
+                }
+            }
+
+            // フラグをOFFに更新
+            self.px4chrdev[target_idx].lnb_power = false;
+        } else {
+            // ---- ON にする処理 ----
+            // 最初の1基目がONになるタイミングで、GPIO 11 を HIGH に引き上げる
+            if self.lnb_power_count == 0 {
+                // ONにする際のエラーは致命的なため、? で即座にエラーを返して状態を更新しない
+                self.it930x.write_gpio(11, true)?;
+            }
+
+            self.lnb_power_count += 1;
+            // フラグをONに更新
+            self.px4chrdev[target_idx].lnb_power = true;
+        }
+
         Ok(())
     }
 
-    // memo: await 消したので、tokio いらないかも？
-    // バックエンドの電源状態を制御します (px4_backend_set_power)
-    fn backend_set_power(&self, state: bool) -> Result<(), CtrlMsgError> {
-        // デバッグ出力相当（必要に応じてログライブラリを使用）
-        println!(
-            "px4_backend_set_power: {}",
-            if state { "on" } else { "off" }
-        );
+    // ハードウェアの一斉初期化用関数(open_count が 0 のときに、内部から呼ぶ関数)
+    // px4_chrdev_open の中で、open_count が 0 のときの処理を抽出
+    fn init(&mut self) -> Result<(), TunerError> {
+        println!("First tuner open requested. Powering on backend hardware...");
+        // 295行目
+        self.backend_set_power(true)?;
 
-        if state {
-            // 電源 ON シーケンス
-            // GPIO 0 を Low にしてリセット解除 (?)
-            self.it930x.write_regs(0xd8b4, &[0x01])?; // GPIO 0 output enable
-            self.it930x.write_regs(0xd8b3, &[0x00])?; // GPIO 0 output low
-
-            // 10ms 待機
-            std::thread::sleep(std::time::Duration::from_millis(10));
-
-            // GPIO 0 を High に
-            self.it930x.write_regs(0xd8b3, &[0x01])?; // GPIO 0 output high
-
-            // 10ms 待機
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        } else {
-            // 電源 OFF シーケンス
-            // GPIO 0 を Low にして保持
-            self.it930x.write_regs(0xd8b4, &[0x01])?;
-            self.it930x.write_regs(0xd8b3, &[0x00])?;
+        // 310行目 (px4_backend_init の中身で、r850 および rt710 の init を呼ぶ)
+        for chrdev in self.px4chrdev.iter_mut() {
+            // チューナー側のレジスタ初期化（元の C の r850_init など）をここで叩く
+            chrdev.tuner.init()?;
         }
 
         Ok(())
+    }
+
+    pub fn open_tuner(&mut self, target_idx: usize) -> Result<(), TunerError> {
+        println!("[Px4Device] Opening channel index: {}", target_idx);
+        // すでにオープンされている場合は、何もせず成功を返す
+        if self.px4chrdev[target_idx].is_opened {
+            return Ok(());
+        }
+
+        // memo: 今の所、mldev を想定していないので無視
+
+        if self.open_count == 0 {
+            // 295行目
+            self.init()?;
+
+            // 初期化直後は全チップが起きているので、自分以外を即座に眠らせる（前回のclose代用案）
+            for (i, chrdev) in self.px4chrdev.iter_mut().enumerate() {
+                if i != target_idx {
+                    chrdev.tuner.close()?;
+                }
+            }
+        }
+
+        // 目的のターゲットチャンネルをウェイクアップ（起動）させる
+        self.px4chrdev[target_idx].tuner.open()?;
+        self.px4chrdev[target_idx].is_opened = true;
+
+        self.open_count += 1;
+
+        Ok(())
+    }
+
+    // px4_chrdev_release に相当
+    // 若干、順序が違う気がしないでも無いけど、多分大丈夫
+    pub fn close_tuner(&mut self, target_idx: usize) -> Result<(), TunerError> {
+        println!("[Px4Device] Closing channel index: {}", target_idx);
+
+        // すでに閉じている場合は何もしない
+        if !self.px4chrdev[target_idx].is_opened {
+            return Ok(());
+        }
+
+        // ISDB_S（BS/CS）の場合は、チューナーを閉じる前にLNB電源を確実に落とす
+        if self.px4chrdev[target_idx].system == System::ISDB_S {
+            if let Err(e) = self.set_lnb_voltage(target_idx, 0) {
+                println!("[error] Failed to stop LNB voltage during close: {:?}", e);
+            }
+        }
+
+        // 1. まずは対象のチャンネルのハードウェアをスリープさせる
+        self.px4chrdev[target_idx].tuner.close()?;
+        self.px4chrdev[target_idx].is_opened = false;
+
+        self.open_count -= 1;
+
+        // 2. もし最後のチャンネルが閉じられたなら、エコモード（電源OFF）に移行する
+        if self.open_count == 0 {
+            println!("All tuners closed. Powering off backend hardware...");
+
+            // 全チップの論理的な終了処理（フラグクリア等）
+            for chrdev in self.px4chrdev.iter_mut() {
+                chrdev.tuner.term()?;
+            }
+
+            // 【最重要】基板全体の電源を落とす
+            self.backend_set_power(false)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<'a, B: BusOps + Sync> Drop for Px4Device<'a, B> {
+    fn drop(&mut self) {
+        println!("[Px4Device] Dropping device, ensuring power is off...");
+        // 電源が入ったままなら強制的に切る
+        if self.open_count > 0 {
+            let _ = self.backend_set_power(false);
+        }
+        // ここで it930x の終了処理 (Cコードの it930x_term) などを呼べれば呼びます
     }
 }
