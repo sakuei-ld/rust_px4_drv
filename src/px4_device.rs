@@ -1,4 +1,6 @@
+use std::ptr::fn_addr_eq;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::itedtv_bus::BusOps;
@@ -140,14 +142,35 @@ impl<'a> Px4StreamContext<'a> {
 }
 
 // チューナーデバイスの必要なパラメータ
+struct ChrdevConfig {
+    system: System,
+    addr: u8,
+    is_secondary: bool,
+}
 // System, TC90522 bus の順
 // これは、W3U4 の場合だけ
 // S1UR とか Q3U4 のときは知らないが、Q3U4 は多分、これで良い。(これの外側で2つ持つイメージだと思う)
-const PX4_CHRDEV_CONFIGS: [(System, u8); 4] = [
-    (System::ISDB_S, 0x11),
-    (System::ISDB_S, 0x13),
-    (System::ISDB_T, 0x10),
-    (System::ISDB_T, 0x12),
+const PX4_CHRDEV_CONFIGS: [ChrdevConfig; 4] = [
+    ChrdevConfig {
+        system: System::ISDB_S,
+        addr: 0x11,
+        is_secondary: false,
+    },
+    ChrdevConfig {
+        system: System::ISDB_S,
+        addr: 0x13,
+        is_secondary: true,
+    },
+    ChrdevConfig {
+        system: System::ISDB_T,
+        addr: 0x10,
+        is_secondary: false,
+    },
+    ChrdevConfig {
+        system: System::ISDB_T,
+        addr: 0x12,
+        is_secondary: true,
+    },
 ];
 
 /*
@@ -196,9 +219,24 @@ pub trait Tuner {
     fn open(&self) -> Result<(), TunerError>;
     fn close(&self) -> Result<(), TunerError>;
 
+    // 録画
+    fn tune(&mut self, freq: u32) -> Result<(), TunerError>;
+
+    // lock状態の確認
+    fn is_locked(&self) -> Result<bool, TunerError>;
+
+    fn enable_ts_pins(&mut self, enable: bool) -> Result<(), TunerError>;
+
+    // CNR(raw) を読み取るメソッド
+    fn read_cnr_raw(&self) -> Result<u32, TunerError>;
+
     // 論理的な終了処理
     // 各チューナーチップが「電源が落とされた」ことを認識し、内部状態をリセットするためのメソッド
     fn term(&mut self) -> Result<(), TunerError>;
+}
+
+pub trait SatelliteTuner {
+    fn set_stream_id(&mut self, stream_id: u16) -> Result<(), TunerError>;
 }
 
 pub struct Px4Chrdev<'a> {
@@ -214,7 +252,7 @@ pub struct Px4Chrdev<'a> {
     pub tx: Sender<Vec<u8>>,
 
     //pub tc90522: &'a TC90522<'a, B>,
-    pub tuner: Box<dyn Tuner + Send + 'a>,
+    pub tuner: Box<dyn Tuner + Send + Sync + 'a>,
 
     // オープン状態かのフラグ
     pub is_opened: bool,
@@ -241,6 +279,11 @@ impl<'a> Px4Chrdev<'a> {
 
         Ok(())
     }
+
+    pub fn tune(&mut self, freq: u32) -> Result<(), TunerError> {
+        // Tuner トレイトで統一されているため、SかTかを意識せず実行できる
+        self.tuner.tune(freq)
+    }
 }
 
 pub struct Px4Device<'a, B: BusOps + Sync> {
@@ -249,6 +292,8 @@ pub struct Px4Device<'a, B: BusOps + Sync> {
 
     open_count: usize,
     lnb_power_count: usize,
+
+    streaming_count: usize,
 }
 
 impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
@@ -277,7 +322,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         // アプリケーション側に引き渡すレシーバーを格納するVec
         let mut receivers = Vec::new();
 
-        for (i, (system, addr)) in PX4_CHRDEV_CONFIGS.iter().enumerate() {
+        for (i, config) in PX4_CHRDEV_CONFIGS.iter().enumerate() {
             // px4_device.c 1128 行目に chrdev4->tc90522.i2c = &it930x->i2c_master[1]; とあり
             // it930x.c の 571 行目で、priv->i2c[i].bus = i + 1; で、
             // it930x.c の 575 行目で、it930x->i2c_master[i].priv = &priv->i2c[i] とあるので、
@@ -290,9 +335,13 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             //tc90522s.push(tc90522);
 
             // 1. Tuner構造体を作成
-            let mut tuner_box: Box<dyn Tuner + Send> = match system {
-                System::ISDB_S => Box::new(RT710::new(&it930x, 2, *addr, i % 2 == 1)?),
-                System::ISDB_T => Box::new(R850::new(&it930x, 2, *addr, i % 2 == 1)?),
+            let mut tuner_box: Box<dyn Tuner + Send + Sync> = match config.system {
+                System::ISDB_S => {
+                    Box::new(RT710::new(&it930x, 2, config.addr, config.is_secondary)?)
+                }
+                System::ISDB_T => {
+                    Box::new(R850::new(&it930x, 2, config.addr, config.is_secondary)?)
+                }
             };
 
             // ここでチャンネル(送信・受信のペア)を生成
@@ -301,7 +350,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             receivers.push(rx);
 
             px4chrdev.push(Px4Chrdev {
-                system: *system,
+                system: config.system,
                 port_number: i as u8 + 1,
                 slave_number: i as u8,
                 sync_byte: ((i as u8 + 1) << 4) | 0x07,
@@ -317,6 +366,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             px4chrdev,
             open_count: 0,
             lnb_power_count: 0,
+            streaming_count: 0,
         };
 
         Ok((device, receivers))
@@ -441,6 +491,14 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         self.px4chrdev[target_idx].tuner.open()?;
         self.px4chrdev[target_idx].is_opened = true;
 
+        if self.open_count == 0 {
+            // 一旦、0 と 2 が primary として固定のはずなので、強制で。
+            // PX-Q3U4 のことを考えると、何か必要かも？
+            println!("Performing global demodulator initialization (S0/T0)...");
+            self.px4chrdev[0].tuner.init_0()?;
+            self.px4chrdev[2].tuner.init_0()?;
+        }
+
         self.open_count += 1;
 
         Ok(())
@@ -483,6 +541,189 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         }
 
         Ok(())
+    }
+
+    /// 指定したチャンネルが現在放送波をロックしているか確認する
+    pub fn check_lock(&self, target_idx: usize) -> Result<bool, TunerError> {
+        if !self.px4chrdev[target_idx].is_opened {
+            return Ok(false);
+        }
+        // SかTかを意識することなく、ポリモーフィズムで一発取得
+        self.px4chrdev[target_idx].tuner.is_locked()
+    }
+
+    pub fn start_capture(&mut self, target_idx: usize) -> Result<(), TunerError> {
+        // 1. チューナー固有のTS出力ピンを有効化 (成功すれば後で失敗時に無効化する)
+        self.px4chrdev[target_idx].tuner.enable_ts_pins(true)?;
+
+        // 2. ストリーミングがまだ始まっていなければ、ブリッジ全体の準備をする
+        if self.streaming_count == 0 {
+            // purge
+            if let Err(e) = self.it930x.purge_psb(Duration::from_millis(2000)) {
+                // purge 失敗時はピン出力を戻す
+                let _ = self.px4chrdev[target_idx].tuner.enable_ts_pins(false);
+                return Err(e.into());
+            }
+
+            // 全ポートの「Sender(tx)」と「port_number」のリストだけをクローン
+            // クロージャの中に move
+            let mut dispatch_targets: Vec<(u8, Sender<Vec<u8>>)> = self
+                .px4chrdev
+                .iter()
+                .map(|c| (c.port_number, c.tx.clone()))
+                .collect();
+
+            // 柔軟な残差処理のため、バッファもスレッド側へ
+            let stream_buffer = Mutex::new(Vec::with_capacity(1024 * 64));
+
+            // ストリームハンドラの開始
+            if let Err(e) = self.it930x.start_streaming(move |data| {
+                // Mutex のロックを取得して、内部バッファを可変として取り出す
+                let mut stream_buffer = stream_buffer.lock().unwrap();
+
+                // 1. 新しいデータをバッファに結合
+                stream_buffer.extend_from_slice(data);
+
+                // 2. 752 byte (4パケット分) 以上ある間、同期チェックと切り出しをループ
+                let mut offset = 0;
+                while offset + PX4_DEVICE_TS_SYNC_SIZE <= stream_buffer.len() {
+                    let mut is_synced = true;
+                    for i in 0..PX4_DEVICE_TS_SYNC_COUNT {
+                        if (stream_buffer[offset + i * 188] & 0x8f) != 0x07 {
+                            is_synced = false;
+                            break;
+                        }
+                    }
+
+                    if !is_synced {
+                        offset += 1;
+                        continue;
+                    }
+
+                    // 同期が取れたら、188 byte 単位でパケットを切り出して Sender に分配
+                    while offset + 188 <= stream_buffer.len()
+                        && (stream_buffer[offset] & 0x8f) == 0x07
+                    {
+                        let id = (stream_buffer[offset] & 0x70) >> 4;
+
+                        if id > 0 && id < 5 {
+                            // 同期バイトを 0x47 に書き換え
+                            stream_buffer[offset] = 0x47;
+                            let packet = &stream_buffer[offset..offset + 188];
+
+                            // 対応するポートにデータを送信 (C の dispatch_packet の役割も内包)
+                            if let Some((_, tx)) =
+                                dispatch_targets.iter().find(|(port, _)| *port == id)
+                            {
+                                let _ = tx.send(packet.to_vec());
+                            }
+                        }
+                        offset += 188;
+                    }
+                }
+
+                stream_buffer.drain(0..offset);
+            }) {
+                let _ = self.px4chrdev[target_idx].tuner.enable_ts_pins(false);
+                return Err(e.into());
+            }
+        }
+
+        self.streaming_count += 1;
+        Ok(())
+    }
+
+    pub fn stop_capture(&mut self, target_idx: usize) -> Result<(), TunerError> {
+        if self.streaming_count == 0 {
+            return Err(TunerError::InvalidState); // EALREADY相当
+        }
+
+        self.streaming_count -= 1;
+
+        // 1. 誰もストリーミングしていないなら、ブリッジ全体を停止
+        if self.streaming_count == 0 {
+            self.it930x.stop_streaming()?;
+        }
+
+        // 2. チューナー固有のTS出力ピンを無効化
+        self.px4chrdev[target_idx].tuner.enable_ts_pins(false)?;
+
+        Ok(())
+    }
+
+    pub fn set_capture(&mut self, target_idx: usize, status: bool) -> Result<(), TunerError> {
+        if status {
+            self.start_capture(target_idx)
+        } else {
+            self.stop_capture(target_idx)
+        }
+    }
+
+    /*
+    fn dispatch_packet(&self, packet: &[u8]) {
+        // パケットヘッダからPIDを読み取り、対応するチャンネルへ流す処理
+        // C言語の px4_device_stream_handler 相当
+        let pid = ((packet[1] as u16 & 0x1f) << 8) | (packet[2] as u16);
+
+        // チャンネルごとのフィルタ設定に基づいて処理を分岐
+        for chrdev in &self.px4chrdev {
+            // もしこのチャンネルがこのPIDを要求していればバッファへ追記
+            // chrdev.write_ts_packet(packet);
+        }
+    }
+
+    pub fn stream_handler(&self, data: &[u8]) {
+        // デバッグ用: 受信データの確認
+        println!("[Px4Device] Received {} bytes of data", data.len());
+
+        // C言語のロジックに基づき、TSパケット(通常188バイト)単位で解析・分配します
+        // データには複数のパケットが含まれている可能性があるため、188バイトずつ処理
+        let packet_size = 188;
+        let num_packets = data.len() / packet_size;
+
+        for i in 0..num_packets {
+            let offset = i * packet_size;
+            let packet = &data[offset..offset + packet_size];
+
+            // 1. 各チャンネル(px4chrdev)がストリーミング中か確認
+            // 2. チャンネルが受信している特定のPIDやIDに基づいてパケットを分配
+            // 3. 各チャンネルのバッファへ書き込み
+
+            // 同期バイト 0x47 を確認
+            if packet[0] == 0x47 {
+                self.dispatch_packet(packet);
+            }
+        }
+    }
+    */
+
+    pub fn parse_serial_number(serial_str: &str) -> Result<(u64, u8), CtrlMsgError> {
+        if serial_str.len() != 15 {
+            return Err(CtrlMsgError::InvalidArgument);
+        }
+        let full_val = serial_str
+            .parse::<u64>()
+            .map_err(|_| CtrlMsgError::InvalidArgument)?;
+
+        let serial_number = full_val / 10;
+        let dev_id = (full_val % 10) as u8;
+
+        Ok((serial_number, dev_id))
+    }
+
+    pub fn tune(&mut self, target_idx: usize, freq: u32) -> Result<(), TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
+        // チャンネルがオープンされているか確認（またはオープンされていればチューニング可能とする設計）
+        if !self.px4chrdev[target_idx].is_opened {
+            return Err(TunerError::InvalidState);
+        }
+
+        // 該当する chrdev の tune メソッドを呼ぶ
+        self.px4chrdev[target_idx].tune(freq)
     }
 }
 
