@@ -11,6 +11,10 @@ use it930x::IT930x;
 use itedtv_bus::UsbBusRusb;
 use px4_device::Px4Device;
 
+use std::thread;
+
+use crate::px4_device::Tuner;
+
 fn main() {
     // まず、USB関連の準備
     let context = match Context::new() {
@@ -65,49 +69,122 @@ fn main() {
 
     let it930x = IT930x::new(bus);
 
-    // 疎通チェック
-    if let Err(e) = it930x.raise() {
-        println!("Failed to raise.: {}", e);
-        return;
+    let (mut px4_device, receivers) = match Px4Device::new(&it930x) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("Failed to init Px4Device: {:?}", e);
+            return;
+        }
+    };
+
+    println!("[debug] Px4Device initialized successfully!");
+
+    // 受信スレッドの準備 (各ポートごとにスレッドを立てる)
+    let mut handles = Vec::new();
+    for (i, rx) in receivers.into_iter().enumerate() {
+        handles.push(thread::spawn(move || {
+            println!("[receiver] Port {} listening...", i + 1);
+            let mut packet_count = 0;
+
+            // 受信ループ
+            while let Ok(packet) = rx.recv() {
+                packet_count += 1;
+                if packet_count % 1000 == 0 {
+                    println!(
+                        "[receiver] Port {} received {} packets",
+                        i + 1,
+                        packet_count
+                    );
+                }
+
+                // ここで b25 等にパケットを渡してデコード処理を行う
+                // 実際には、recisdb に投げれば良いので、デコードはここの仕事にしない
+            }
+        }));
     }
 
-    if let Err(e) = it930x.load_firmware("it930x-firmware.bin") {
-        println!("Failed to load firmware.: {}", e);
-        return;
+    // 4ch 同時動作確認用
+
+    struct TunerConfig {
+        port: usize,
+        name: &'static str,
+        freq_khz: u32,
     }
 
-    if let Err(e) = it930x.init_warm() {
-        println!("Failed to initial warm.: {}", e);
-        return;
+    let target_configs = vec![
+        TunerConfig {
+            port: 0,
+            name: "ISDB-S(1)",
+            //freq_khz: 1235000,
+            freq_khz: 1049480,
+        }, // BS15 (NHK BS)
+        TunerConfig {
+            port: 1,
+            name: "ISDB-S(2)",
+            //freq_khz: 1049480,
+            freq_khz: 1235000,
+        }, // BS1 (BS朝日/TBS)
+        TunerConfig {
+            port: 2,
+            name: "ISDB-T(1)",
+            freq_khz: 473143 + (27 - 13) * 6000,
+        }, // 物理27ch (例: NHK総合)
+        TunerConfig {
+            port: 3,
+            name: "ISDB-T(2)",
+            freq_khz: 473143 + (25 - 13) * 6000,
+        }, // 物理25ch (例: 日本テレビ)
+    ];
+
+    // 1. 全ポートのオープンと選局 (Tune) を行う
+    for config in &target_configs {
+        println!("[debug] Opening {} on Port {}...", config.name, config.port);
+        if let Err(e) = px4_device.open_tuner(config.port) {
+            println!("  ➔ Failed to open port {}: {:?}", config.port, e);
+            return;
+        }
+
+        println!(
+            "[debug] Tuning {} to {} kHz...",
+            config.name, config.freq_khz
+        );
+
+        if let Err(e) = px4_device.tune(config.port, config.freq_khz) {
+            println!("  ➔ Failed to tune port {}: {:?}", config.port, e);
+            // エラーになっても他のポートのテストを続ける場合は continue に変更してください
+            return;
+        }
+
+        thread::sleep(std::time::Duration::from_millis(500))
     }
 
-    it930x
-        .set_gpio_mode(7, it930x::GpioMode::Out, true)
-        .expect("gpio7 mode failed");
-    it930x
-        .set_gpio_mode(2, it930x::GpioMode::Out, true)
-        .expect("gpio2 mode failed");
+    println!("[debug] All tuners initialized and tuned. Starting capture...");
 
-    it930x.write_gpio(7, true).expect("gpio7 write failed");
-    it930x.write_gpio(2, false).expect("gpio2 write failed");
-
-    it930x
-        .set_gpio_mode(11, it930x::GpioMode::Out, true)
-        .expect("gpio11 mode failed");
-    it930x.write_gpio(11, false).expect("gpio11 write failed.");
-
-    // Px4Device の init() で、R850 や RT710 の read_regs が走るので、いつ init() すべきかは、ちゃんと考える必要がある。
-    let mut px4dev = Px4Device::new(&it930x);
-
-    println!("[debug] px4_dev.set_power() start => ");
-    if let Err(e) = px4dev.set_power(true) {
-        println!("Failed to TunerError: {}", e);
+    // 2. 全ポートのキャプチャを一斉に開始
+    for config in &target_configs {
+        if let Err(e) = px4_device.set_capture(config.port, true) {
+            println!(
+                "  ➔ Failed to start capture on port {}: {:?}",
+                config.port, e
+            );
+        } else {
+            println!(
+                "  ➔ Capture started on Port {} ({})",
+                config.port, config.name
+            );
+        }
     }
 
-    println!("[debug] px4_dev.init() start => ");
-    if let Err(e) = px4dev.init() {
-        println!("Failed to TunerError: {}", e);
-        return;
+    println!("[debug] 4-Channel Capturing... Press Enter to STOP.");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+
+    // 3. 終了処理 (全ポートのキャプチャ停止とクローズ)
+    println!("\nStopping all channels...");
+    for config in &target_configs {
+        let _ = px4_device.set_capture(config.port, false);
+        let _ = px4_device.close_tuner(config.port);
+        println!("  ➔ Closed Port {} ({})", config.port, config.name);
     }
 
     println!("[debug] Passed!")
