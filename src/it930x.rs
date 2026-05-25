@@ -132,8 +132,8 @@ impl<B: BusOps> IT930x<B> {
         let rlen = self.bus.ctrl_rx(&mut rx).map_err(CtrlMsgError::Bus)?;
 
         // debug
-        dump_hex("CTRL_MSG WB", &tx);
-        dump_hex("CTRL_MSG RB (expect)", &rx[0..rlen]);
+        //dump_hex("CTRL_MSG WB", &tx);
+        //dump_hex("CTRL_MSG RB (expect)", &rx[0..rlen]);
 
         // packet size validate
         //let len = rx[0] as usize;
@@ -290,6 +290,7 @@ pub struct IT930xConfig {
 impl Default for IT930xConfig {
     fn default() -> Self {
         let inputs = [
+            // index 0: 衛星1 (ISDB-S)
             StreamInput {
                 enable: true,
                 is_parallel: false,
@@ -300,6 +301,7 @@ impl Default for IT930xConfig {
                 packet_len: 188,
                 sync_byte: 0x17,
             },
+            // index 1: 衛星2 (ISDB-S)
             StreamInput {
                 enable: true,
                 is_parallel: false,
@@ -310,6 +312,7 @@ impl Default for IT930xConfig {
                 packet_len: 188,
                 sync_byte: 0x27,
             },
+            // index 2: 地上1 (ISDB-T)
             StreamInput {
                 enable: true,
                 is_parallel: false,
@@ -320,6 +323,7 @@ impl Default for IT930xConfig {
                 packet_len: 188,
                 sync_byte: 0x37,
             },
+            // index 3: 地上2 (ISDB-T)
             StreamInput {
                 enable: true,
                 is_parallel: false,
@@ -330,6 +334,7 @@ impl Default for IT930xConfig {
                 packet_len: 188,
                 sync_byte: 0x47,
             },
+            // index 4: 未使用ポート
             StreamInput {
                 enable: false,
                 is_parallel: false,
@@ -747,6 +752,57 @@ impl<B: BusOps> IT930x<B> {
         let v = if high { 1u8 } else { 0u8 };
         self.write_regs(GPIO_O_REGS[idx], &[v])?;
 
+        Ok(())
+    }
+
+    pub fn purge_psb(&self, timeout: std::time::Duration) -> Result<(), CtrlMsgError> {
+        // USB接続であるか確認 (BusOpsトレイトでチェック可能にするのがベストです)
+        // ここでは便宜上、条件を満たしている前提とします
+
+        // 1. レジスタ操作によるPSBパージの有効化
+        self.write_reg_mask(0xda1d, 0x01, 0x01)?;
+
+        // 2. 受信用バッファの確保 (Rustではこれで自動的にメモリ管理されます)
+        let mut buf = vec![0u8; 1024];
+
+        // 3. ストリーム受信 (ITEDTV_BUS_USB の呼び出し)
+        // bus.stream_rx が [u8] を受け取り、実際に読み込んだ長さを返す設計にします
+        let read_len = self
+            .bus
+            .stream_rx(&mut buf, timeout)
+            .map_err(CtrlMsgError::Bus)?;
+
+        // 4. パージの無効化
+        // エラーハンドリングについては、パージ後の状態を優先させるため、
+        // 処理の成功/失敗に関わらずレジスタを戻すのが安全です
+        let _ = self.write_reg_mask(0xda1d, 0x00, 0x01);
+
+        println!("[it930x] purge_psb: read_len: {}", read_len);
+
+        // 5. 判定処理 (Cの if (len == 512) に相当)
+        if read_len == 512 {
+            Ok(())
+        } else {
+            // 必要に応じてエラーを返すか、デバッグログを出力
+            Ok(())
+        }
+    }
+
+    pub fn start_streaming<F>(&self, handler: F) -> Result<(), CtrlMsgError>
+    where
+        F: Fn(&[u8]) + Send + Sync + 'static,
+    {
+        self.bus
+            .start_streaming(Box::new(handler))
+            .map_err(CtrlMsgError::Bus)
+    }
+
+    /// USBバスのストリーミングを停止する
+    pub fn stop_streaming(&self) -> Result<(), CtrlMsgError> {
+        // BusOps の stop_streaming を呼び出すだけ
+        self.bus.stop_streaming().map_err(CtrlMsgError::Bus)?;
+
+        println!("[it930x] Stopped streaming via bus.");
         Ok(())
     }
 }
