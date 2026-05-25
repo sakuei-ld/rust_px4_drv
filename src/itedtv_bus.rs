@@ -4,6 +4,7 @@
 // → USB実装を差し替えやすくなる、らしい。
 
 use rusb::{Context, DeviceHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -31,7 +32,10 @@ pub trait BusOps {
     // ストリーム受信(Bulk In)
     fn stream_rx(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, BusError>;
     // ストリーミング開始
-    fn start_streaming(&self) -> Result<(), BusError>;
+    fn start_streaming(
+        &self,
+        handler: Box<dyn Fn(&[u8]) + Send + Sync + 'static>,
+    ) -> Result<(), BusError>;
     // ストリーミング停止
     fn stop_streaming(&self) -> Result<(), BusError>;
 
@@ -48,6 +52,8 @@ pub struct UsbBusRusb {
     ctrl_timeout: Duration,
     max_bulk_size: u32,
     is_streaming: Mutex<bool>,
+
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl UsbBusRusb {
@@ -101,6 +107,7 @@ impl UsbBusRusb {
             ctrl_timeout: Duration::from_millis(3000), // px4_usb_params.c px4_usb_params.ctrl_timeout から。
             max_bulk_size,                             //max_bulk_size,
             is_streaming: Mutex::new(false),
+            stop_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -133,15 +140,56 @@ impl BusOps for UsbBusRusb {
 
     // itedtv_bus.c の 411〜509 と思われる。
     // mutex や メモリ確保、とかのように見える。
-    fn start_streaming(&self) -> Result<(), BusError> {
+    fn start_streaming(
+        &self,
+        handler: Box<dyn Fn(&[u8]) + Send + Sync + 'static>,
+    ) -> Result<(), BusError> {
         let mut streaming = self.is_streaming.lock().unwrap();
         if *streaming {
             return Ok(());
         }
 
+        *streaming = true;
+
         println!("[usb_bus] Start stream...");
 
-        *streaming = true;
+        // 1. ハンドラをスレッドに引き渡すための設定
+        // C言語の ctx->stream_handler = handler; に相当
+        let handler = handler;
+
+        // handle をクローンして移動させる
+        let handle_mutex = self.handle.clone(); // DeviceHandleのclone (rusb仕様)
+
+        // スレッドを停止させるためのセッター変数
+        self.stop_flag.store(false, Ordering::SeqCst);
+        let stop_flag_thread = self.stop_flag.clone();
+
+        // stream ep
+        let ep = self.stream_ep;
+
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 512 * 8]; // バルク転送のバッファ
+
+            // ループ内でロックを適切に取得する
+            while !stop_flag_thread.load(Ordering::Relaxed) {
+                // Bulk In を実行 (タイムアウト付き)
+                let result = {
+                    let handle = handle_mutex.lock().unwrap();
+                    handle.read_bulk(ep, &mut buf, Duration::from_millis(100))
+                };
+
+                match result {
+                    Ok(len) => {
+                        // データが取れたら handler を叩く
+                        handler(&buf[..len]);
+                    }
+                    Err(rusb::Error::Timeout) => continue, // タイムアウトは無視して継続
+                    Err(_) => break,                       // エラー発生時はループを抜ける
+                }
+            }
+            println!("[usb_bus] Stream thread terminated.");
+        });
+
         Ok(())
     }
 
@@ -153,9 +201,14 @@ impl BusOps for UsbBusRusb {
             return Ok(());
         }
 
+        // スレッドを止めるフラグを立てる
+        self.stop_flag.store(true, Ordering::SeqCst);
+
+        // 2. フラグを下ろして停止を通知
+        *streaming = false;
+
         println!("[usb_bus] Stopping stream...");
 
-        *streaming = false;
         Ok(())
     }
 
@@ -190,5 +243,3 @@ impl Drop for UsbBusRusb {
         // ここでハンドルがスコープを抜ければ、USBデバイスは自動的にクローズされる、らしい。
     }
 }
-
-// ここまでが USBバスレイヤー
