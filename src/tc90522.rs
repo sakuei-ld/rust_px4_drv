@@ -79,7 +79,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     }
 
     // 明示的な終了処理 (tc90522_term()相当)
-    pub fn term(&mut self) -> Result<(), TunerError>{
+    pub fn term(&mut self) -> Result<(), TunerError> {
         println!("[info] TC90522 terminating: powering down...");
 
         // デバイスをスリープ状態にする
@@ -205,8 +205,8 @@ impl<'a, B: BusOps> TC90522<'a, B> {
             return self.it930x.i2c_master_request(self.bus, &mut master);
         }
         */
-
         for req in requests.iter_mut() {
+            /*
             println!(
                 "[tc90522.req] target_addr=0x{:02X} {:?} len={} first={:02X?}",
                 req.addr,
@@ -214,12 +214,14 @@ impl<'a, B: BusOps> TC90522<'a, B> {
                 req.data.len(),
                 &req.data.get(..req.data.len().min(8)).unwrap_or(&[])
             );
+            */
 
             match req.req {
                 I2CRequestType::Read => {
                     let mut write_buf = [0xFE, (req.addr << 1) | 0x01];
 
                     // debug
+                    /*
                     println!(
                         "[tc90522->it930x] READ-SET bus={} it930x_addr=0x{:02X} data={:02X?}",
                         self.bus, self.i2c_addr, &write_buf
@@ -230,6 +232,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
                         self.i2c_addr,
                         req.data.len()
                     );
+                    */
 
                     let mut master = [
                         I2CCommRequest {
@@ -258,10 +261,12 @@ impl<'a, B: BusOps> TC90522<'a, B> {
                     buf.extend_from_slice(req.data);
 
                     // debug
+                    /*
                     println!(
                         "[tc90522->it930x] WRITE bus={} it930x_addr=0x{:02X} data={:02X?}",
                         self.bus, self.i2c_addr, &buf
                     );
+                    */
 
                     let mut master = [I2CCommRequest {
                         addr: self.i2c_addr,
@@ -455,7 +460,7 @@ impl<'a, B: BusOps> Drop for TC90522<'a, B> {
         // Cコードの tc90522_term() 相当の処理
         // デバイスをスリープ状態にする
         // 保険としての終了処理とし、エラーは無視。
-        
+
         println!("[info] TC90522 dropping: powering down...");
 
         let _ = self.sleep(true);
