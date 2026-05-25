@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use crate::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
 use crate::itedtv_bus::BusOps;
-use crate::px4_device::Tuner;
+use crate::px4_device::{SatelliteTuner, Tuner};
 use crate::tc90522::{System, TunerError, TC90522};
 
 const NUM_REGS: usize = 0x10;
@@ -397,7 +397,8 @@ impl<'a, B: BusOps> RT710<'a, B> {
         );
 
         // 生成された直後に、この論理コアをスリープ状態にする
-        tc90522.sleep(true)?;
+        //tc90522.sleep(true)?;
+        // まだ、ちゃんと立ち上がってなくて、送れないっぽい
 
         Ok(Self {
             tc90522,
@@ -667,7 +668,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
     }
 
     // 指定した周波数でPLLが正常にロック（同調）したかを判定
-    pub fn is_pll_locked(&self) -> Result<bool, TunerError> {
+    fn is_pll_locked(&self) -> Result<bool, TunerError> {
         let priv_data = self.priv_.lock().unwrap();
         if !priv_data.init {
             return Err(TunerError::InvalidState);
@@ -814,7 +815,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
         // 3. 復調器をスリープ
         self.tc90522.sleep(true)?;
 
-        println!("[R850] Device closed and put to sleep.");
+        println!("[RT710] Device closed and put to sleep.");
         Ok(())
     }
 
@@ -824,6 +825,64 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
         println!("[RT710] Performing global demodulator initialization (S0)...");
         self.tc90522.write_multiple_regs(&TC_INIT_S0)?;
         Ok(())
+    }
+
+    fn tune(&mut self, freq: u32) -> Result<(), TunerError> {
+        // px4_device.c のコードの一部を切り出して、RT710の役割として貼り付け
+        // px4_chrdev_tune_s() の移植
+        // 1. AGC設定（false）
+        self.tc90522.set_agc(false)?;
+        self.tc90522.write_regs(0x8e, &[0x06])?;
+        self.tc90522.write_regs(0xa3, &[0xf7])?;
+
+        // 2. 周波数設定 (RT710はシンボルレート等のパラメータが必要)
+        self.set_params(freq, 28860, 4)?;
+
+        // 3. PLLロック待ち
+        let mut locked = false;
+        for _ in 0..50 {
+            if self.is_pll_locked()? {
+                locked = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        if !locked {
+            return Err(TunerError::InvalidState); // EAGAIN相当
+        }
+
+        // 信号強度の取得（デバッグ用）
+        if let Ok(ss) = self.get_rf_signal_strength() {
+            println!(
+                "[RT710] Locked. Strength: {}.{:03} dBm",
+                ss / 1000,
+                -ss % 1000
+            );
+        }
+
+        // 4. AGC設定（true）
+        self.tc90522.set_agc(true)?;
+
+        Ok(())
+    }
+
+    fn is_locked(&self) -> Result<bool, TunerError> {
+        // px4_device.c のコードの一部を切り出して、RT710の役割として貼り付け
+        // px4_chrdev_check_lock_s() の移植
+        // 地デジ側と全く同じコードで、内部の tc90522 が自動的に ISDB-S 用のレジスタ(0xc3)を見てくれます
+        let locked = self.tc90522.is_signal_locked()?;
+        Ok(locked)
+    }
+
+    fn enable_ts_pins(&mut self, enable: bool) -> Result<(), TunerError> {
+        // 内部の tc90522 に対して enable_ts_pins を呼ぶ
+        self.tc90522.enable_ts_pins(enable)?;
+        Ok(())
+    }
+
+    fn read_cnr_raw(&self) -> Result<u32, TunerError> {
+        self.tc90522.get_cn().map_err(|e| TunerError::CtrlMsg(e))
     }
 
     fn term(&mut self) -> Result<(), TunerError> {
@@ -848,6 +907,52 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
         self.tc90522.term()?;
 
         Ok(())
+    }
+}
+
+impl<'a, B: BusOps> SatelliteTuner for RT710<'a, B> {
+    fn set_stream_id(&mut self, stream_id: u16) -> Result<(), TunerError> {
+        let tsid = if stream_id < 12 {
+            // TMCC から TSID を取得するループ (100回 * 10ms = 1秒)
+            let mut found_tsid = 0;
+            for _ in 0..100 {
+                if let Ok(id) = self.tc90522.tmcc_get_tsid(stream_id as u8) {
+                    if id != 0 {
+                        found_tsid = id;
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if found_tsid == 0 {
+                return Err(TunerError::InvalidState);
+            } // EAGAIN
+            found_tsid
+        } else {
+            stream_id
+        };
+
+        // 設定の反映
+        self.tc90522.set_tsid(tsid)?;
+
+        // 設定確認のループ
+        for i in 0..100 {
+            if let Ok(current_tsid) = self.tc90522.get_tsid() {
+                if i % 10 == 0 {
+                    println!(
+                        "[debug] TSID retry {}: expected=0x{:04X}, got=0x{:04X}",
+                        i, tsid, current_tsid
+                    );
+                }
+
+                if current_tsid == tsid {
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        Err(TunerError::InvalidState) // 設定失敗
     }
 }
 

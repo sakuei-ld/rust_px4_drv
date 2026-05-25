@@ -3498,15 +3498,17 @@ impl<'a, B: BusOps> R850<'a, B> {
         );
 
         // 生成された直後に、この論理コアをスリープ状態にする
-        tc90522.sleep(true)?;
+        //tc90522.sleep(true)?;
+        // まだ、ちゃんと立ち上がってなくて、送れないっぽい
 
         Ok(Self {
             tc90522,
             i2c_addr: 0x7c,
 
             config: R850Config {
-                xtal: 0,
-                loop_through: false,
+                xtal: 24000,
+                //loop_through: false,
+                loop_through: !is_secondary, // チューナー生成時に、i==2 が true、i==3 が false で、is_secondary と逆なので。
                 clock_out: false,
                 no_imr_calibration: false,
                 no_lpf_calibration: false,
@@ -3827,6 +3829,57 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
         println!("[R850] Performing global demodulator initialization (T0)...");
         self.tc90522.write_multiple_regs(&TC_INIT_T0)?;
         Ok(())
+    }
+
+    fn tune(&mut self, freq: u32) -> Result<(), TunerError> {
+        // px4_device.c のコードの一部を切り出して、R850の役割として貼り付け
+        // px4_chrdev_tune_t() の移植
+        // 1. AGC設定
+        self.tc90522.write_regs(0x47, &[0x30])?;
+        self.tc90522.set_agc(false)?;
+        self.tc90522.write_regs(0x76, &[0x0c])?;
+
+        // 2. 周波数設定
+        self.set_frequency(freq)?;
+
+        // 3. PLLロック待ち (50回 * 10ms = 500ms)
+        let mut locked = false;
+        for _ in 0..50 {
+            if self.is_pll_locked()? {
+                locked = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        if !locked {
+            return Err(TunerError::InvalidState); // EAGAIN相当
+        }
+
+        // 4. AGC復帰と事後レジスタ設定
+        self.tc90522.set_agc(true)?;
+        self.tc90522
+            .write_multiple_regs(&[(0x71, &[0x21]), (0x72, &[0x25]), (0x75, &[0x08])])?;
+
+        Ok(())
+    }
+
+    fn is_locked(&self) -> Result<bool, TunerError> {
+        // px4_device.c のコードの一部を切り出して、R850の役割として貼り付け
+        // px4_chrdev_check_lock_t() の移植
+        // tc90522.rs の `is_signal_locked` を呼び出す (CtrlMsgErrorは ? で自動変換されます)
+        let locked = self.tc90522.is_signal_locked()?;
+        Ok(locked)
+    }
+
+    fn enable_ts_pins(&mut self, enable: bool) -> Result<(), TunerError> {
+        // 内部の tc90522 に対して enable_ts_pins を呼ぶ
+        self.tc90522.enable_ts_pins(enable)?;
+        Ok(())
+    }
+
+    fn read_cnr_raw(&self) -> Result<u32, TunerError> {
+        self.tc90522.get_cn().map_err(|e| TunerError::CtrlMsg(e))
     }
 
     /// 明示的な終了処理
