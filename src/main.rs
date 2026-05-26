@@ -1,19 +1,10 @@
-mod it930x;
-mod itedtv_bus;
-mod px4_device;
-mod r850;
-mod rt710;
-mod tc90522;
-
 use rusb::{Context, UsbContext};
 
-use it930x::IT930x;
-use itedtv_bus::UsbBusRusb;
-use px4_device::Px4Device;
+use rust_px4_usr_drv::drivers::it930x::IT930x;
+use rust_px4_usr_drv::drivers::itedtv_bus::UsbBusRusb;
+use rust_px4_usr_drv::drivers::px4_device::{Px4Device, Tuner};
 
 use std::thread;
-
-use crate::px4_device::Tuner;
 
 fn main() {
     // まず、USB関連の準備

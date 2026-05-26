@@ -1,10 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
-use crate::itedtv_bus::BusOps;
-use crate::px4_device::Tuner;
-use crate::tc90522::{System, TunerError, TC90522};
+use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
+use crate::drivers::itedtv_bus::BusOps;
+use crate::drivers::px4_device::Tuner;
+use crate::drivers::tc90522::{System, TunerError, TC90522};
 
 const R850_NUM_REGS: usize = 0x30;
 
