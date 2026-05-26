@@ -1,14 +1,13 @@
-use std::ptr::fn_addr_eq;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::itedtv_bus::BusOps;
-use crate::r850::R850;
-use crate::rt710::RT710;
-use crate::tc90522::{System, TunerError};
+use crate::drivers::itedtv_bus::BusOps;
+use crate::drivers::r850::R850;
+use crate::drivers::rt710::RT710;
+use crate::drivers::tc90522::{System, TunerError};
 
-use crate::it930x::{CtrlMsgError, GpioMode, IT930x};
+use crate::drivers::it930x::{CtrlMsgError, GpioMode, IT930x};
 
 const PX4_DEVICE_TS_SYNC_COUNT: usize = 4;
 const PX4_DEVICE_TS_SYNC_SIZE: usize = 188 * PX4_DEVICE_TS_SYNC_COUNT;
