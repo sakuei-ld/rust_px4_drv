@@ -3,10 +3,8 @@
 use std::sync::Mutex;
 
 // 多分、これで大丈夫だと思う。
-use crate::{it930x::IT930x, itedtv_bus::BusOps};
-
-// 同じ定義を使うだけ
-use crate::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType};
+use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
+use crate::drivers::itedtv_bus::BusOps;
 
 // エラー関連 (RT710 および R850 の TunerError は共通のはずなので、共通でアクセスするこちらに保持)
 use thiserror::Error;

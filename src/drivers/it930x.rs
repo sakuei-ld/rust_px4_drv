@@ -15,7 +15,7 @@ pub struct I2CCommRequest<'a> {
     pub req: I2CRequestType,
 }
 
-use crate::itedtv_bus::{BusError, BusOps};
+use crate::drivers::itedtv_bus::{BusError, BusOps};
 
 // エラー型
 //
