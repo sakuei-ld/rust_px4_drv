@@ -1,4 +1,5 @@
-use std::sync::mpsc::{channel, Receiver, Sender};
+//use std::sync::mpsc::{channel, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -43,26 +44,6 @@ pub enum Px4MldevMode {
     S0Only,
     S1Only,
 }
-
-// ストリームコンテキスト
-// TSパケットの同期を管理する。(構造を変えたので、ここは削除予定)
-/*
-struct Px4StreamContext {
-    // 各チャンネルの参照（またはID）を保持
-    // Cの struct ptx_chrdev *chrdev[PX4_CHRDEV_NUM] に相当
-    remain_buf: [u8; PX4_DEVICE_TS_SYNC_SIZE],
-    remain_len: usize,
-}
-
-impl Px4StreamContext {
-    fn new() -> Self {
-        Self {
-            remain_buf: [0u8; PX4_DEVICE_TS_SYNC_SIZE],
-            remain_len: 0,
-        }
-    }
-}
-*/
 
 /// remain_len などの複雑なフラグ制御を完全に排除し、Rust 向けに最適化したプロセス関数
 fn px4_device_stream_process(chrdevs: &mut [Px4Chrdev], buf: &mut [u8]) -> usize {
@@ -172,44 +153,6 @@ const PX4_CHRDEV_CONFIGS: [ChrdevConfig; 4] = [
     },
 ];
 
-/*
-// チューナーが開かれる際に、それぞれの復調器に書き込むパラメータ(らしい)
-const TC_INIT_T: [(u8, u8); 10] = [
-    (0xb0, 0xa0),
-    (0xb2, 0x3d),
-    (0xb3, 0x25),
-    (0xb4, 0x8b),
-    (0xb5, 0x4b),
-    (0xb6, 0x3f),
-    (0xb7, 0xff),
-    (0xb8, 0xc0),
-    (0x1f, 0x00),
-    (0x75, 0x00),
-];
-const TC_INIT_S: [(u8, u8); 3] = [(0x15, 0x00), (0x1d, 0x00), (0x04, 0x02)];
-
-// デバイス全体の初期化用
-const TC_INIT_S0: [(u8, u8); 2] = [(0x07, 0x31), (0x08, 0x77)];
-const TC_INIT_T0: [(u8, u8); 2] = [(0x0e, 0x77), (0x0f, 0x13)];
-*/
-
-// Tuner を Trait にするために一旦削除
-/*
-pub enum Tuner<'a, B: BusOps> {
-    RT710(RT710<'a, B>),
-    R850(R850<'a, B>),
-}
-
-impl<'a, B: BusOps> Tuner<'a, B> {
-    pub fn term(&mut self) -> Result<(), TunerError> {
-        match self {
-            Tuner::RT710(t) => t.term(),
-            Tuner::R850(t) => t.term(),
-        }
-    }
-}
-    */
-
 pub trait Tuner {
     // チューナー初期化
     fn init(&mut self) -> Result<(), TunerError>;
@@ -229,15 +172,17 @@ pub trait Tuner {
     // CNR(raw) を読み取るメソッド
     fn read_cnr_raw(&self) -> Result<u32, TunerError>;
 
+    // BS用
+    // デフォルト実装により、全チューナーで強制させない
+    fn set_stream_id(&mut self, _stream_id: u16) -> Result<(), TunerError> {
+        // 地上波チューナーなどはここでエラーを返せば良い
+        Err(TunerError::InvalidState)
+    }
+
     // 論理的な終了処理
     // 各チューナーチップが「電源が落とされた」ことを認識し、内部状態をリセットするためのメソッド
     fn term(&mut self) -> Result<(), TunerError>;
 }
-
-pub trait SatelliteTuner {
-    fn set_stream_id(&mut self, stream_id: u16) -> Result<(), TunerError>;
-}
-
 pub struct Px4Chrdev<'a> {
     pub system: System,
 
@@ -282,6 +227,10 @@ impl<'a> Px4Chrdev<'a> {
     pub fn tune(&mut self, freq: u32) -> Result<(), TunerError> {
         // Tuner トレイトで統一されているため、SかTかを意識せず実行できる
         self.tuner.tune(freq)
+    }
+
+    pub fn set_stream_id(&mut self, streamd_id: u16) -> Result<(), TunerError> {
+        self.tuner.set_stream_id(streamd_id)
     }
 }
 
@@ -344,7 +293,8 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             };
 
             // ここでチャンネル(送信・受信のペア)を生成
-            let (tx, rx) = channel();
+            //let (tx, rx) = channel();
+            let (tx, rx) = unbounded::<Vec<u8>>();
             // 受信側 (rx) はリストに保存して最後に init の戻り値として返す
             receivers.push(rx);
 
@@ -396,7 +346,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     // BS/CSアンテナ用のLNB給電設定 ... チューナー外なので、Px4Device で管理。
-    fn set_lnb_voltage(&mut self, target_idx: usize, voltage: i32) -> Result<(), TunerError> {
+    pub fn set_lnb_voltage(&mut self, target_idx: usize, voltage: i32) -> Result<(), TunerError> {
         // 一応、ISDB-T はスルーするようにしておく
         if self.px4chrdev[target_idx].system == System::ISDB_T {
             return Ok(());
@@ -466,6 +416,11 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     pub fn open_tuner(&mut self, target_idx: usize) -> Result<(), TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
         println!("[Px4Device] Opening channel index: {}", target_idx);
         // すでにオープンされている場合は、何もせず成功を返す
         if self.px4chrdev[target_idx].is_opened {
@@ -506,6 +461,11 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     // px4_chrdev_release に相当
     // 若干、順序が違う気がしないでも無いけど、多分大丈夫
     pub fn close_tuner(&mut self, target_idx: usize) -> Result<(), TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
         println!("[Px4Device] Closing channel index: {}", target_idx);
 
         // すでに閉じている場合は何もしない
@@ -633,6 +593,11 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     pub fn stop_capture(&mut self, target_idx: usize) -> Result<(), TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
         if self.streaming_count == 0 {
             return Err(TunerError::InvalidState); // EALREADY相当
         }
@@ -651,6 +616,11 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     pub fn set_capture(&mut self, target_idx: usize, status: bool) -> Result<(), TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
         if status {
             self.start_capture(target_idx)
         } else {
@@ -723,6 +693,25 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
         // 該当する chrdev の tune メソッドを呼ぶ
         self.px4chrdev[target_idx].tune(freq)
+    }
+
+    pub fn set_stream_id(&mut self, target_idx: usize, stream_id: u16) -> Result<(), TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
+        self.px4chrdev[target_idx].set_stream_id(stream_id)
+    }
+
+    pub fn get_cnr(&mut self, target_idx: usize) -> Result<u32, TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
+        // tuner.read_cnr_raw() を呼び出す
+        self.px4chrdev[target_idx].tuner.read_cnr_raw()
     }
 }
 

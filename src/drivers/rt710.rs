@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
 use crate::drivers::itedtv_bus::BusOps;
-use crate::drivers::px4_device::{SatelliteTuner, Tuner};
+use crate::drivers::px4_device::Tuner;
 use crate::drivers::tc90522::{System, TunerError, TC90522};
 
 const NUM_REGS: usize = 0x10;
@@ -885,32 +885,6 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
         self.tc90522.get_cn().map_err(|e| TunerError::CtrlMsg(e))
     }
 
-    fn term(&mut self) -> Result<(), TunerError> {
-        {
-            let mut priv_data = self.priv_.lock().unwrap();
-
-            if !priv_data.init {
-                return Ok(()); // 既に終了済みなら何もしない
-            }
-
-            println!("[rt710] terminating tuner...");
-
-            // 1. 自身のハードウェアをスリープ
-            let _ = self.sleep(&*priv_data);
-
-            // 2. 状態をクリア
-            priv_data.init = false;
-            priv_data.freq = 0;
-        }
-
-        // 3. 内包する復調器 (TC90522) の終了処理を連鎖させる
-        self.tc90522.term()?;
-
-        Ok(())
-    }
-}
-
-impl<'a, B: BusOps> SatelliteTuner for RT710<'a, B> {
     fn set_stream_id(&mut self, stream_id: u16) -> Result<(), TunerError> {
         let tsid = if stream_id < 12 {
             // TMCC から TSID を取得するループ (100回 * 10ms = 1秒)
@@ -953,6 +927,30 @@ impl<'a, B: BusOps> SatelliteTuner for RT710<'a, B> {
         }
 
         Err(TunerError::InvalidState) // 設定失敗
+    }
+
+    fn term(&mut self) -> Result<(), TunerError> {
+        {
+            let mut priv_data = self.priv_.lock().unwrap();
+
+            if !priv_data.init {
+                return Ok(()); // 既に終了済みなら何もしない
+            }
+
+            println!("[rt710] terminating tuner...");
+
+            // 1. 自身のハードウェアをスリープ
+            let _ = self.sleep(&*priv_data);
+
+            // 2. 状態をクリア
+            priv_data.init = false;
+            priv_data.freq = 0;
+        }
+
+        // 3. 内包する復調器 (TC90522) の終了処理を連鎖させる
+        self.tc90522.term()?;
+
+        Ok(())
     }
 }
 
