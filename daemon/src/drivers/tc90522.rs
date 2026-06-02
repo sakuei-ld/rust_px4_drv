@@ -87,6 +87,9 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // I2C経由のTC90522レジスタの読み込み (排他制御なし)
     fn read_regs_nolock(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
+        // debug
+        //println!("[tc90522] read_regs_nolock(): reg={:02X}", reg);
+
         if buf.is_empty() {
             return Err(CtrlMsgError::InvalidLength);
         }
@@ -111,12 +114,14 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // I2C経由のTC90522レジスタの読み込み
     pub fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
+        //println!("[tc90522] call read_regs");
         let _lock = self.lock.lock().unwrap();
         self.read_regs_nolock(reg, buf)
     }
 
     // I2C経由のTC90522レジスタの多重読み込み
     pub fn read_multiple_regs(&self, regs: &mut [(u8, &mut [u8])]) -> Result<(), CtrlMsgError> {
+        //println!("[tc90522] call read_multiple_regs");
         let _lock = self.lock.lock().unwrap();
 
         for (reg, data) in regs.iter_mut() {
@@ -128,6 +133,18 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // I2C経由のTC90522レジスタの書き込み (排他制御なし)
     fn write_regs_nolock(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
+        // debug
+        /*
+            println!(
+                "[tc90522] write_regs_nolock(): reg = {:02X}, buf = {}",
+                reg,
+                buf.iter()
+                    .map(|b| format!("{:02X}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        */
+
         if buf.is_empty() || (buf.len() > 254) {
             return Err(CtrlMsgError::InvalidLength);
         }
@@ -147,12 +164,14 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // I2C経由のTC90522レジスタの書き込み
     pub fn write_regs(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
+        //println!("[tc90522] call write_regs");
         let _lock = self.lock.lock().unwrap();
         self.write_regs_nolock(reg, buf)
     }
 
     // I2C経由のTC90522レジスタの多重書き込み
     pub fn write_multiple_regs(&self, regs: &[(u8, &[u8])]) -> Result<(), CtrlMsgError> {
+        //println!("[tc90522] call write_multiple_regs");
         let _lock = self.lock.lock().unwrap();
         for &(reg, data) in regs {
             self.write_regs_nolock(reg, data)?;
@@ -164,6 +183,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     // チューナーチップへのI2Cブリッジ通信
     // TC90522特有のパケット整形を行う。
     pub fn i2c_master_request(&self, requests: &mut [I2CCommRequest]) -> Result<(), CtrlMsgError> {
+        //println!("[tc90522] call i2c_master_request");
         let _lock = self.lock.lock().unwrap();
 
         /*
@@ -281,6 +301,9 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // PD操作(各方式(インスタンスが保持するモード)のデジタル回路を低電力状態にする)
     pub fn sleep(&self, sleep: bool) -> Result<(), CtrlMsgError> {
+        // debug
+        println!("[tc90522] sleep(): sleep = {}", sleep);
+
         match self.system {
             System::ISDB_S => {
                 if sleep {
@@ -295,6 +318,12 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // AGC設定(自動利得制御(信号増幅)の設定)
     pub fn set_agc(&self, on: bool) -> Result<(), CtrlMsgError> {
+        // debug
+        println!(
+            "[debug] set_agc(): on = {}, is_secondary = {}",
+            on, self.is_secondary
+        );
+
         match self.system {
             System::ISDB_S => {
                 let mut r10 = if self.is_secondary { 0x30 } else { 0xB0 };
@@ -328,6 +357,9 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // TMCC(制御信号) から TSID(ストリーム識別子) を取得 (ISDB-S専用)
     pub fn tmcc_get_tsid(&self, idx: u8) -> Result<u16, CtrlMsgError> {
+        // debug
+        //println!("[tc90522] tmcc_get_tsid(): idx = {}", idx);
+
         match self.system {
             System::ISDB_S => {
                 if idx >= 12 {
@@ -352,6 +384,9 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     /// TSID (Transport Stream ID) を取得 (ISDB-S専用)
     pub fn get_tsid(&self) -> Result<u16, CtrlMsgError> {
+        // debug
+        //println!("[tc90522] get_tsid() called");
+
         match self.system {
             System::ISDB_S => {
                 let mut b = [0u8; 2];
@@ -369,6 +404,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     /// TSID (Transport Stream ID) を設定 (ISDB-S専用)
     pub fn set_tsid(&self, tsid: u16) -> Result<(), CtrlMsgError> {
+        //println!("[tc90522] set_tsid(): tsid = {}", tsid);
         match self.system {
             System::ISDB_S => {
                 // 移植元 0x8f レジスタへ書き込み
@@ -384,6 +420,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     /// C/N比（信号品質）に関連する生データを取得
     pub fn get_cn(&self) -> Result<u32, CtrlMsgError> {
+        //println!("[tc90522] call get_cn");
         match self.system {
             System::ISDB_S => {
                 // tc90522_get_cn_s 相当 (16bit)
@@ -405,6 +442,8 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // TSデータ出力ピン(IT930xへのデータ出力物理ピン)の有効/無効化
     pub fn enable_ts_pins(&self, enable: bool) -> Result<(), CtrlMsgError> {
+        // debug
+        println!("[tc90522] enable_ts_pins(): enable = {}", enable);
         match self.system {
             System::ISDB_S => {
                 // tc90522_enable_ts_pins_s 相当
@@ -424,12 +463,21 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // signal lock のチェック(ロック状態が、電波を掴めて、デジタル復元が出来ている状態、らしい)
     pub fn is_signal_locked(&self) -> Result<bool, CtrlMsgError> {
+        // debug
+        println!("[tc90522] call is_signal_locked");
         match self.system {
             System::ISDB_S => {
                 // tc90522_is_signal_locked_s 相当
                 // レジスタ 0xc3 の 0x10 ビットが 0 ならロック
                 let mut b = [0u8];
                 self.read_regs(0xc3, &mut b)?;
+
+                // ★ここに追加：どんな値が読み出されているか確認する
+                //println!(
+                //    "[debug] TC90522::is_signal_locked System::ISDB_S reg 0xc3 = 0x{:02X}",
+                //    b[0]
+                //);
+
                 Ok((b[0] & 0x10) == 0)
             }
             System::ISDB_T => {
@@ -450,6 +498,20 @@ impl<'a, B: BusOps> TC90522<'a, B> {
             }
         }
     }
+
+    // debug用
+    /*
+    pub fn dump_regs(&self, start: u8, end: u8) -> Result<(), CtrlMsgError> {
+        for reg in start..=end {
+            let mut buf = [0u8];
+            self.read_regs(reg, &mut buf)?;
+
+            println!("[dump] TC90522 reg[0x{:02X}] = 0x{:02X}", reg, buf[0]);
+        }
+
+        Ok(())
+    }
+    */
 }
 
 // term() の代わり および Rust として、終了時に適切にデバイスを止めるための実装をここで行う。

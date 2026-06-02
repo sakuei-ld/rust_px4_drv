@@ -54,6 +54,8 @@ pub struct UsbBusRusb {
     is_streaming: Mutex<bool>,
 
     stop_flag: Arc<AtomicBool>,
+
+    stream_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl UsbBusRusb {
@@ -108,6 +110,7 @@ impl UsbBusRusb {
             max_bulk_size,                             //max_bulk_size,
             is_streaming: Mutex::new(false),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            stream_thread: Mutex::new(None),
         })
     }
 }
@@ -167,6 +170,7 @@ impl BusOps for UsbBusRusb {
         // stream ep
         let ep = self.stream_ep;
 
+        /*
         thread::spawn(move || {
             let mut buf = vec![0u8; 512 * 8]; // バルク転送のバッファ
 
@@ -189,12 +193,44 @@ impl BusOps for UsbBusRusb {
             }
             println!("[usb_bus] Stream thread terminated.");
         });
+        */
+
+        let join_handle = thread::spawn(move || {
+            let mut buf = vec![0u8; 512 * 8];
+
+            while !stop_flag_thread.load(Ordering::Acquire) {
+                let result = {
+                    let handle = handle_mutex.lock().unwrap();
+                    handle.read_bulk(ep, &mut buf, Duration::from_millis(100))
+                };
+
+                match result {
+                    Ok(len) => {
+                        handler(&buf[..len]);
+                    }
+
+                    Err(rusb::Error::Timeout) => {
+                        continue;
+                    }
+
+                    Err(e) => {
+                        println!("[usb_bus] stream read error: {:?}", e);
+                        break;
+                    }
+                }
+            }
+
+            println!("[usb_bus] Stream thread terminated.");
+        });
+
+        *self.stream_thread.lock().unwrap() = Some(join_handle);
 
         Ok(())
     }
 
     // itedtv_bus.c の 511〜540 と思われる。
     // たぶん、streaming の開始で取った諸々を片付ける処理が入っている、と思われる。
+    /*
     fn stop_streaming(&self) -> Result<(), BusError> {
         let mut streaming = self.is_streaming.lock().unwrap();
         if !*streaming {
@@ -208,6 +244,29 @@ impl BusOps for UsbBusRusb {
         *streaming = false;
 
         println!("[usb_bus] Stopping stream...");
+
+        Ok(())
+    }
+    */
+
+    fn stop_streaming(&self) -> Result<(), BusError> {
+        let mut streaming = self.is_streaming.lock().unwrap();
+
+        if !*streaming {
+            return Ok(());
+        }
+
+        self.stop_flag.store(true, Ordering::SeqCst);
+
+        println!("[usb_bus] Waiting stream thread...");
+
+        if let Some(handle) = self.stream_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        *streaming = false;
+
+        println!("[usb_bus] Stopped stream.");
 
         Ok(())
     }

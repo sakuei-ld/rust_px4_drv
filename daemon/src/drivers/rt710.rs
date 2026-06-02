@@ -9,11 +9,11 @@ use crate::drivers::tc90522::{System, TunerError, TC90522};
 const NUM_REGS: usize = 0x10;
 
 const RT710_INIT_REGS: [u8; NUM_REGS] = [
-    0x03, 0x5c, 0x08, 0x30, 0x41, 0x48, 0xed, 0x25, 0x47, 0xfc, 0x48, 0x22, 0x08, 0x0f, 0xf3, 0x59,
+    0x40, 0x1d, 0x20, 0x10, 0x41, 0x50, 0xed, 0x25, 0x07, 0x58, 0x39, 0x64, 0x38, 0xe7, 0x90, 0x35,
 ];
 
 const RT720_INIT_REGS: [u8; NUM_REGS] = [
-    0xff, 0x5c, 0x88, 0x30, 0x41, 0xc8, 0xed, 0x25, 0x47, 0xfc, 0x48, 0xa2, 0x08, 0x0f, 0xf3, 0x59,
+    0x00, 0x1c, 0x00, 0x10, 0x41, 0x48, 0xda, 0x4b, 0x07, 0x58, 0x38, 0x40, 0x37, 0xe7, 0x4c, 0x59,
 ];
 
 const SLEEP_REGS: [u8; NUM_REGS] = [
@@ -378,6 +378,8 @@ impl<'a, B: BusOps> RT710<'a, B> {
         // 設定が成功したら周波数を記録
         priv_data.freq = freq;
 
+        println!("[RT710] PLL freq={}", freq);
+
         Ok(())
     }
 
@@ -388,6 +390,9 @@ impl<'a, B: BusOps> RT710<'a, B> {
         tc90522_addr: u8,
         is_secondary: bool,
     ) -> Result<Self, TunerError> {
+        // debug
+        println!("[RT710] new()");
+
         let tc90522 = TC90522::new(
             it930x,
             tc90522_bus,
@@ -450,8 +455,8 @@ impl<'a, B: BusOps> RT710<'a, B> {
 
         // debug
         println!(
-            "[debug] rt710.sleep chip={:?} clock_out={} r01=0x{:02x} r03=0x{:02x}",
-            priv_data.chip, self.config.clock_out, regs[0x01], regs[0x03]
+            "[debug] rt710.sleep chip={:?} clock_out={} i2c_addr={:02X} r01=0x{:02x} r03=0x{:02x}",
+            priv_data.chip, self.config.clock_out, self.i2c_addr, regs[0x01], regs[0x03]
         );
 
         self.write_regs(0x00, &regs)?;
@@ -462,12 +467,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
     // 選局処理 らしい
     // 各種設定を反映し、set_pll() で周波数を合わせる。
     // その後、シンボルレートとロールオフ率から適切な帯域幅（Bandwidth）パラメータを計算し、フィルターを設定する。
-    pub fn set_params(
-        &self,
-        freq: u32,
-        mut symbol_rate: u32,
-        rolloff: u32,
-    ) -> Result<(), TunerError> {
+    fn set_params(&self, freq: u32, mut symbol_rate: u32, rolloff: u32) -> Result<(), TunerError> {
         // 1. 基本チェック
         if rolloff > 5 {
             return Err(TunerError::InvalidArgument);
@@ -613,15 +613,14 @@ impl<'a, B: BusOps> RT710<'a, B> {
             // Cコード上では順序が逆で、意味が無いので、コメントアウト
             // Cコードの実装ミスの可能性があり、場合によっては、この処理を入れた方が良い可能性あり
             // 受信幅のマージンを増やすための処理っぽい？
-            //if symbol_rate <= 15000 {
-            //    symbol_rate += 3000;
-            //} else if symbol_rate <= 20000 {
-            //    symbol_rate += 2000;
-            //} else if symbol_rate <= 30000 {
-            //    symbol_rate += 1000;
-            //}
+            if symbol_rate <= 15000 {
+                symbol_rate += 3000;
+            } else if symbol_rate <= 20000 {
+                symbol_rate += 2000;
+            } else if symbol_rate <= 30000 {
+                symbol_rate += 1000;
+            }
 
-            //let s = sr_adj * 12;
             let s = symbol_rate * 12;
 
             if s <= (88000 + range) {
@@ -664,6 +663,11 @@ impl<'a, B: BusOps> RT710<'a, B> {
         regs[0x0f] = ((bw_param.coarse << 2) & 0xfc) | (bw_param.fine & 0x03);
         self.write_regs(0x0f, &[regs[0x0f]])?;
 
+        println!(
+            "[RT710] BW coarse={} fine={} reg0f=0x{:02x}",
+            bw_param.coarse, bw_param.fine, regs[0x0f]
+        );
+
         Ok(())
     }
 
@@ -684,6 +688,9 @@ impl<'a, B: BusOps> RT710<'a, B> {
 
     // 現在チューナーに設定されている RF ゲインのインデックス値（0〜18程度）を計算、取得する。
     pub fn get_rf_gain(&self) -> Result<u8, TunerError> {
+        // debug
+        println!("[RT710] call get_rf_gain().");
+
         let priv_data = self.priv_.lock().unwrap();
         if !priv_data.init {
             return Err(TunerError::InvalidState);
@@ -753,6 +760,9 @@ impl<'a, B: BusOps> RT710<'a, B> {
 impl<'a, B: BusOps> Tuner for RT710<'a, B> {
     // チューナー初期化
     fn init(&mut self) -> Result<(), TunerError> {
+        // debug
+        println!("[RT710] init()");
+
         let mut chip_type = RT710ChipType::UNKNOWN;
         let mut tmp = [0u8; 1];
         {
@@ -787,6 +797,9 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
     // デバイスの利用を開始する
     // px4_device.c の一部の機能を切り出し
     fn open(&self) -> Result<(), TunerError> {
+        // debug
+        println!("[RT710] call open().");
+
         // 1. 個別ウェイクアップレジスタ (tc_init_s) の書き込み
         self.tc90522.write_multiple_regs(&TC_INIT_S)?;
 
@@ -796,6 +809,8 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
         // 3. 復調器のスリープを解除
         self.tc90522.sleep(false)?;
 
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
         println!("[RT710] Device opened and awakened successfully.");
         Ok(())
     }
@@ -803,6 +818,9 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
     // デバイスの利用を終了する
     // px4_device.c の一部の機能を切り出し
     fn close(&self) -> Result<(), TunerError> {
+        // debug
+        println!("[RT710] call close().");
+
         let priv_data = self.priv_.lock().unwrap();
 
         // 逆の順序で終了させる
@@ -824,10 +842,16 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
         // 481行目の処理で、Tuner の オープン1個目のときに走らせる。
         println!("[RT710] Performing global demodulator initialization (S0)...");
         self.tc90522.write_multiple_regs(&TC_INIT_S0)?;
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
         Ok(())
     }
 
     fn tune(&mut self, freq: u32) -> Result<(), TunerError> {
+        // debug
+        println!("[RT710] tune(): freq = {}", freq);
+
         // px4_device.c のコードの一部を切り出して、RT710の役割として貼り付け
         // px4_chrdev_tune_s() の移植
         // 1. AGC設定（false）
@@ -868,10 +892,14 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
     }
 
     fn is_locked(&self) -> Result<bool, TunerError> {
+        // debug
+        println!("[RT710] call is_locked().");
+
         // px4_device.c のコードの一部を切り出して、RT710の役割として貼り付け
         // px4_chrdev_check_lock_s() の移植
-        // 地デジ側と全く同じコードで、内部の tc90522 が自動的に ISDB-S 用のレジスタ(0xc3)を見てくれます
+        // 地デジ側と全く同じコードで、内部の tc90522 が自動的に ISDB-S 用のレジスタ(0xc3)を見てくれる
         let locked = self.tc90522.is_signal_locked()?;
+
         Ok(locked)
     }
 
@@ -952,6 +980,14 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
 
         Ok(())
     }
+
+    /*
+    fn dump_regs(&mut self, start: u8, end: u8) -> Result<(), TunerError> {
+        self.tc90522
+            .dump_regs(start, end)
+            .map_err(|e| TunerError::CtrlMsg(e))
+    }
+    */
 }
 
 impl<'a, B: BusOps> Drop for RT710<'a, B> {

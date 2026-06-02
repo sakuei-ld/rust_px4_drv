@@ -8,10 +8,18 @@ use crate::drivers::r850::R850;
 use crate::drivers::rt710::RT710;
 use crate::drivers::tc90522::{System, TunerError};
 
-use crate::drivers::it930x::{CtrlMsgError, GpioMode, IT930x};
+use crate::drivers::it930x::{CtrlMsgError, GpioMode, IT930x, PidFilter};
 
 const PX4_DEVICE_TS_SYNC_COUNT: usize = 4;
 const PX4_DEVICE_TS_SYNC_SIZE: usize = 188 * PX4_DEVICE_TS_SYNC_COUNT;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Px4MldevMode {
+    All,
+    SOnly,
+    S0Only,
+    S1Only,
+}
 
 /// px4_device_params.c に相当する設定群
 #[derive(Debug, Clone)]
@@ -37,95 +45,12 @@ impl Default for Px4DeviceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Px4MldevMode {
-    All,
-    SOnly,
-    S0Only,
-    S1Only,
-}
-
-/// remain_len などの複雑なフラグ制御を完全に排除し、Rust 向けに最適化したプロセス関数
-fn px4_device_stream_process(chrdevs: &mut [Px4Chrdev], buf: &mut [u8]) -> usize {
-    let mut offset = 0;
-
-    // 4パケット分の同期チェックを行うため、最低でも 752 バイト残っている間ループする
-    while offset + PX4_DEVICE_TS_SYNC_SIZE <= buf.len() {
-        let mut is_synced = true;
-
-        // 4パケット連続で同期パターン (xxxx 0111) が一致するかチェック
-        for i in 0..PX4_DEVICE_TS_SYNC_COUNT {
-            if (buf[offset + i * 188] & 0x8f) != 0x07 {
-                is_synced = false;
-                break;
-            }
-        }
-
-        // 同期が確認できなかった場合、1バイト進めてリトライ (Cコードの p++ 相当)
-        if !is_synced {
-            offset += 1;
-            continue;
-        }
-
-        // 同期が取れたあと、ここから188バイト単位で処理可能な限りパケットを切り出す
-        while offset + 188 <= buf.len() && (buf[offset] & 0x8f) == 0x07 {
-            // パケットヘッダからポートID (1〜4) を抽出
-            let id = (buf[offset] & 0x70) >> 4;
-
-            if id > 0 && id < 5 {
-                // 同期バイトを通常の MPEG-2 TS 規格である 0x47 に書き換える
-                buf[offset] = 0x47;
-
-                let packet = &buf[offset..offset + 188];
-
-                // 該当するポートIDを持つ Px4Chrdev を探してデータを配信
-                if let Some(chrdev) = chrdevs.iter().find(|c| c.port_number == id) {
-                    // 既存のメソッドを呼び出すだけで安全に送信されます
-                    chrdev.put_stream(packet);
-                }
-            }
-
-            offset += 188;
-        }
-    }
-
-    // 消費した（次回への持ち越しが不要な）バイト数を親に返す
-    offset
-}
-
-struct Px4StreamContext<'a> {
-    pub chrdevs: Vec<Px4Chrdev<'a>>,
-    // 柔軟に伸縮する動的バッファ
-    pub buffer: Vec<u8>,
-}
-
-impl<'a> Px4StreamContext<'a> {
-    pub fn new(chrdevs: Vec<Px4Chrdev<'a>>) -> Self {
-        Self {
-            chrdevs,
-            // 予めある程度の容量を確保しておくことで、再アロケーションのオーバーヘッドをゼロにできます
-            buffer: Vec::with_capacity(1024 * 64),
-        }
-    }
-
-    /// ユーザー空間向けの非常にシンプルなストリームハンドラ
-    pub fn handle_stream(&mut self, new_data: &[u8]) {
-        // 1. 新しく届いたデータをバッファの後方にそのまま結合
-        self.buffer.extend_from_slice(new_data);
-
-        // 2. 結合されたバッファ全体に対してスキャンを実行
-        let consumed = px4_device_stream_process(&mut self.chrdevs, &mut self.buffer);
-
-        // 3. 処理が完了した分のデータをバッファの先頭から削除し、残差を前方に詰める
-        self.buffer.drain(0..consumed);
-    }
-}
-
 // チューナーデバイスの必要なパラメータ
 struct ChrdevConfig {
     system: System,
     addr: u8,
     is_secondary: bool,
+    options: u32,
 }
 // System, TC90522 bus の順
 // これは、W3U4 の場合だけ
@@ -135,21 +60,25 @@ const PX4_CHRDEV_CONFIGS: [ChrdevConfig; 4] = [
         system: System::ISDB_S,
         addr: 0x11,
         is_secondary: false,
+        options: 0, // px4_device.c 1263行目参照
     },
     ChrdevConfig {
         system: System::ISDB_S,
         addr: 0x13,
         is_secondary: true,
+        options: 0,
     },
     ChrdevConfig {
         system: System::ISDB_T,
         addr: 0x10,
         is_secondary: false,
+        options: 0x00000080, // px4_device.c 1258行目参照
     },
     ChrdevConfig {
         system: System::ISDB_T,
         addr: 0x12,
         is_secondary: true,
+        options: 0x00000080,
     },
 ];
 
@@ -179,10 +108,15 @@ pub trait Tuner {
         Err(TunerError::InvalidState)
     }
 
+    fn dump_regs(&mut self, _start: u8, _end: u8) -> Result<(), TunerError> {
+        Err(TunerError::InvalidState)
+    }
+
     // 論理的な終了処理
     // 各チューナーチップが「電源が落とされた」ことを認識し、内部状態をリセットするためのメソッド
     fn term(&mut self) -> Result<(), TunerError>;
 }
+
 pub struct Px4Chrdev<'a> {
     pub system: System,
 
@@ -201,6 +135,9 @@ pub struct Px4Chrdev<'a> {
     // オープン状態かのフラグ
     pub is_opened: bool,
 
+    // streaming中かのフラグ
+    pub is_streaming: bool,
+
     // LNB給電中かどうかのフラグ
     pub lnb_power: bool,
 }
@@ -215,7 +152,7 @@ impl<'a> Px4Chrdev<'a> {
     pub fn open(&mut self) -> Result<(), TunerError> {
         println!("[px4] Opening port {}...", self.port_number);
 
-        // 2. トレイトオブジェクト経由でチューナーを開く
+        // トレイトオブジェクト経由でチューナーを開く
         self.tuner.open()?;
 
         // 3. USBブリッジ（IT930x）側のストリーミングを開始（必要に応じて実装）
@@ -232,6 +169,10 @@ impl<'a> Px4Chrdev<'a> {
     pub fn set_stream_id(&mut self, streamd_id: u16) -> Result<(), TunerError> {
         self.tuner.set_stream_id(streamd_id)
     }
+
+    pub fn dump_regs(&mut self, start: u8, end: u8) -> Result<(), TunerError> {
+        self.tuner.dump_regs(start, end)
+    }
 }
 
 pub struct Px4Device<'a, B: BusOps + Sync> {
@@ -245,11 +186,28 @@ pub struct Px4Device<'a, B: BusOps + Sync> {
 }
 
 impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
-    pub fn new(it930x: &'a IT930x<B>) -> Result<(Self, Vec<Receiver<Vec<u8>>>), TunerError> {
+    pub fn new(
+        it930x: &'a IT930x<B>,
+        use_mldev: bool,
+        discard_null_packets: bool,
+    ) -> Result<(Self, Vec<Receiver<Vec<u8>>>), TunerError> {
         // px4_device_init() の処理
-        // it930x.raise 以前は、it930x 生成時に走る(ハズ)
+
+        // 一応、オリジナルでは、ここで parse_serial_number() を走らせる。
+        // 実装してはいるが、ここでは動かしにくい。
+
         // ブリッジ自体の起動
         it930x.raise()?;
+
+        // オリジナルでは、ここで px4_device_load_config()
+        // 中で、EEPROM をチェックしてる、っぽい？
+        let mut buf = [0u8; 1];
+        it930x.read_regs(0x4979, &mut buf)?;
+        if buf[0] == 0 {
+            println!("[Px4Device::new] EEPROM error.");
+            return Err(TunerError::InvalidState);
+        }
+
         it930x.load_firmware("it930x-firmware.bin")?;
         it930x.init_warm()?;
 
@@ -257,11 +215,31 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         it930x.set_gpio_mode(7, GpioMode::Out, true)?;
         it930x.set_gpio_mode(2, GpioMode::Out, true)?;
 
-        it930x.write_gpio(7, true)?;
-        it930x.write_gpio(2, false)?;
+        // use_mldev による分岐
+        if use_mldev {
+            println!("[Px4Device::new] No implemented.")
+        } else {
+            it930x.write_gpio(7, true)?;
+            it930x.write_gpio(2, false)?;
+        }
 
         it930x.set_gpio_mode(11, GpioMode::Out, true)?;
         it930x.write_gpio(11, false)?;
+
+        // NULLパケット (PID: 0x1fff) の破棄設定
+        // 【修正点①】Nullパケット (PID: 0x1fff) の破棄設定
+        if discard_null_packets {
+            let filter = PidFilter {
+                pids: vec![0x1fff],
+                block: true,
+            };
+            // PX4_CHRDEV_CONFIGS の数（通常4つ）だけループしてフィルターを適用
+            for i in 0..PX4_CHRDEV_CONFIGS.len() {
+                it930x
+                    .set_pid_filter(i, Some(&filter))
+                    .map_err(|e| TunerError::from(e))?;
+            }
+        }
 
         // px4_backend_init() の処理 (tc90522 の init の部分) + Rust 向けに拡張
         // Tuner をラップした chrdev の Vec
@@ -306,6 +284,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
                 tx,
                 tuner: tuner_box,
                 is_opened: false,
+                is_streaming: false,
                 lnb_power: false,
             });
         }
@@ -347,6 +326,12 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
     // BS/CSアンテナ用のLNB給電設定 ... チューナー外なので、Px4Device で管理。
     pub fn set_lnb_voltage(&mut self, target_idx: usize, voltage: i32) -> Result<(), TunerError> {
+        // debug
+        println!(
+            "[Px4Device] set_lnb_voltage(): target = {}, voltage = {}",
+            target_idx, voltage
+        );
+
         // 一応、ISDB-T はスルーするようにしておく
         if self.px4chrdev[target_idx].system == System::ISDB_T {
             return Ok(());
@@ -402,7 +387,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     // ハードウェアの一斉初期化用関数(open_count が 0 のときに、内部から呼ぶ関数)
     // px4_chrdev_open の中で、open_count が 0 のときの処理を抽出
     fn init(&mut self) -> Result<(), TunerError> {
-        println!("First tuner open requested. Powering on backend hardware...");
+        println!("[Px4Device] First tuner open requested. Powering on backend hardware...");
         // 295行目
         self.backend_set_power(true)?;
 
@@ -416,15 +401,18 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     pub fn open_tuner(&mut self, target_idx: usize) -> Result<(), TunerError> {
+        // debug
+        println!("[Px4Device] open_tuner(): target = {}", target_idx);
+
         // インデックスの範囲外アクセスを防ぐチェック
         if target_idx >= self.px4chrdev.len() {
             return Err(TunerError::InvalidArgument);
         }
 
-        println!("[Px4Device] Opening channel index: {}", target_idx);
         // すでにオープンされている場合は、何もせず成功を返す
         if self.px4chrdev[target_idx].is_opened {
-            return Ok(());
+            //return Ok(());
+            return Err(TunerError::InvalidState);
         }
 
         // memo: 今の所、mldev を想定していないので無視
@@ -473,6 +461,12 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             return Ok(());
         }
 
+        // 閉じる前にストリーミング中なら強制停止
+        if self.px4chrdev[target_idx].is_streaming {
+            let _ = self.stop_capture(target_idx);
+            self.px4chrdev[target_idx].is_streaming = false;
+        }
+
         // ISDB_S（BS/CS）の場合は、チューナーを閉じる前にLNB電源を確実に落とす
         if self.px4chrdev[target_idx].system == System::ISDB_S {
             if let Err(e) = self.set_lnb_voltage(target_idx, 0) {
@@ -503,7 +497,11 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     /// 指定したチャンネルが現在放送波をロックしているか確認する
+    /// Bon Driver では、lock チェックしてないので、要らないかも？
     pub fn check_lock(&self, target_idx: usize) -> Result<bool, TunerError> {
+        // debug
+        println!("[Px4Device] check_lock(): target = {}", target_idx);
+
         if !self.px4chrdev[target_idx].is_opened {
             return Ok(false);
         }
@@ -513,17 +511,23 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
     pub fn start_capture(&mut self, target_idx: usize) -> Result<(), TunerError> {
         // 1. チューナー固有のTS出力ピンを有効化 (成功すれば後で失敗時に無効化する)
-        self.px4chrdev[target_idx].tuner.enable_ts_pins(true)?;
+        //self.px4chrdev[target_idx].tuner.enable_ts_pins(true)?;
 
         // 2. ストリーミングがまだ始まっていなければ、ブリッジ全体の準備をする
         if self.streaming_count == 0 {
             // purge
             if let Err(e) = self.it930x.purge_psb(Duration::from_millis(2000)) {
+                println!("[Px4Device] start_capture(): failed it930x.purge_psb()");
                 // purge 失敗時はピン出力を戻す
                 let _ = self.px4chrdev[target_idx].tuner.enable_ts_pins(false);
                 return Err(e.into());
             }
+        }
 
+        // 順序が違うらしいので
+        self.px4chrdev[target_idx].tuner.enable_ts_pins(true)?;
+
+        if self.streaming_count == 0 {
             // 全ポートの「Sender(tx)」と「port_number」のリストだけをクローン
             // クロージャの中に move
             let mut dispatch_targets: Vec<(u8, Sender<Vec<u8>>)> = self
@@ -588,6 +592,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             }
         }
 
+        println!("[Px4Device] port {} start capture.", target_idx);
         self.streaming_count += 1;
         Ok(())
     }
@@ -621,51 +626,29 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             return Err(TunerError::InvalidArgument);
         }
 
+        // ストリーミング状態の保護を追加
+        // PTX_START_STREAMING相当
+        let is_streaming = self.px4chrdev[target_idx].is_streaming;
+
         if status {
-            self.start_capture(target_idx)
-        } else {
-            self.stop_capture(target_idx)
-        }
-    }
-
-    /*
-    fn dispatch_packet(&self, packet: &[u8]) {
-        // パケットヘッダからPIDを読み取り、対応するチャンネルへ流す処理
-        // C言語の px4_device_stream_handler 相当
-        let pid = ((packet[1] as u16 & 0x1f) << 8) | (packet[2] as u16);
-
-        // チャンネルごとのフィルタ設定に基づいて処理を分岐
-        for chrdev in &self.px4chrdev {
-            // もしこのチャンネルがこのPIDを要求していればバッファへ追記
-            // chrdev.write_ts_packet(packet);
-        }
-    }
-
-    pub fn stream_handler(&self, data: &[u8]) {
-        // デバッグ用: 受信データの確認
-        println!("[Px4Device] Received {} bytes of data", data.len());
-
-        // C言語のロジックに基づき、TSパケット(通常188バイト)単位で解析・分配します
-        // データには複数のパケットが含まれている可能性があるため、188バイトずつ処理
-        let packet_size = 188;
-        let num_packets = data.len() / packet_size;
-
-        for i in 0..num_packets {
-            let offset = i * packet_size;
-            let packet = &data[offset..offset + packet_size];
-
-            // 1. 各チャンネル(px4chrdev)がストリーミング中か確認
-            // 2. チャンネルが受信している特定のPIDやIDに基づいてパケットを分配
-            // 3. 各チャンネルのバッファへ書き込み
-
-            // 同期バイト 0x47 を確認
-            if packet[0] == 0x47 {
-                self.dispatch_packet(packet);
+            if is_streaming {
+                return Err(TunerError::InvalidState);
             }
+            self.start_capture(target_idx)?;
+            self.px4chrdev[target_idx].is_streaming = true;
+        } else {
+            if !is_streaming {
+                // すでに停止している場合は無視
+                return Ok(());
+            }
+            self.stop_capture(target_idx)?;
+            self.px4chrdev[target_idx].is_streaming = false;
         }
-    }
-    */
 
+        Ok(())
+    }
+
+    // 使わなくいいかも？
     pub fn parse_serial_number(serial_str: &str) -> Result<(u64, u8), CtrlMsgError> {
         if serial_str.len() != 15 {
             return Err(CtrlMsgError::InvalidArgument);
@@ -681,6 +664,12 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     pub fn tune(&mut self, target_idx: usize, freq: u32) -> Result<(), TunerError> {
+        // debug
+        println!(
+            "[Px4Device] tune(): target = {}, freq = {}.",
+            target_idx, freq
+        );
+
         // インデックスの範囲外アクセスを防ぐチェック
         if target_idx >= self.px4chrdev.len() {
             return Err(TunerError::InvalidArgument);
@@ -696,6 +685,12 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     pub fn set_stream_id(&mut self, target_idx: usize, stream_id: u16) -> Result<(), TunerError> {
+        // debug
+        println!(
+            "[Px4Device] set_stream_id(): target = {}, stream_id ={}.",
+            target_idx, stream_id
+        );
+
         // インデックスの範囲外アクセスを防ぐチェック
         if target_idx >= self.px4chrdev.len() {
             return Err(TunerError::InvalidArgument);
@@ -712,6 +707,50 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
         // tuner.read_cnr_raw() を呼び出す
         self.px4chrdev[target_idx].tuner.read_cnr_raw()
+    }
+
+    pub fn is_set_stream_id_before_tune(&mut self, target_idx: usize) -> Result<bool, TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
+        Ok(((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000010) != 0)
+            && (PX4_CHRDEV_CONFIGS[target_idx].system == System::ISDB_S))
+    }
+
+    pub fn is_wait_after_check_lock(&mut self, target_idx: usize) -> Result<bool, TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
+        Ok(((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000080) != 0)
+            && (PX4_CHRDEV_CONFIGS[target_idx].system == System::ISDB_T))
+    }
+
+    pub fn is_set_stream_id_after_tune(&mut self, target_idx: usize) -> Result<bool, TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
+        Ok(((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000010) == 0)
+            && (PX4_CHRDEV_CONFIGS[target_idx].system == System::ISDB_S))
+    }
+
+    pub fn is_wait_after_lock(&mut self, target_idx: usize) -> Result<bool, TunerError> {
+        // インデックスの範囲外アクセスを防ぐチェック
+        if target_idx >= self.px4chrdev.len() {
+            return Err(TunerError::InvalidArgument);
+        }
+
+        Ok((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000040) != 0)
+    }
+
+    // debug用
+    pub fn dump_regs(&mut self, target_idx: usize, start: u8, end: u8) -> Result<(), TunerError> {
+        self.px4chrdev[target_idx].dump_regs(start, end)
     }
 }
 

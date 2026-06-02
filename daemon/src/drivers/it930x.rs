@@ -48,6 +48,13 @@ pub enum CtrlMsgError {
 //use std::os::macos::raw::stat;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
+
+#[derive(Debug, Clone)]
+pub struct PidFilter {
+    pub pids: Vec<u16>, // Cの filter->pid[] に相当
+    pub block: bool,    // Cの filter->block に相当
+}
+
 // シーケンス管理
 pub struct IT930x<B: BusOps> {
     bus: B,
@@ -77,7 +84,17 @@ fn calc_checksum(buf: &[u8]) -> u16 {
 
 // debug用
 fn dump_hex(label: &str, data: &[u8]) {
-    print!("{label} ({}):", data.len());
+    // 現在のミリ秒を取得
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    // 文字列に変換してスライスで先頭4文字をカットする
+    let ts_str = now.to_string();
+    let ts_trimmed = &ts_str[4..];
+
+    print!("    [{}] {label} ({}):", ts_trimmed, data.len());
     for b in data {
         print!(" {:02X}", b);
     }
@@ -89,6 +106,9 @@ impl<B: BusOps> IT930x<B> {
     pub fn ctrl_msg(&self, cmd: u16, wdata: &[u8], rdata: &mut [u8]) -> Result<(), CtrlMsgError> {
         // Mutex
         let _lock = self.ctrl_lock.lock().unwrap();
+
+        // debug
+        //println!("[ctrl_msg] enter cmd=0x{:04x}", cmd);
 
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
 
@@ -125,11 +145,17 @@ impl<B: BusOps> IT930x<B> {
         // USB 送信
         self.bus.ctrl_tx(&tx).map_err(CtrlMsgError::Bus)?;
 
+        // debug
+        //println!("[ctrl_msg] tx ok");
+
         // RX packet
         //let rx_len = 1 + 1 + 1 + rdata.len() + 2; // C コード側は、256個固定で、内容チェックして rdate 側へ書き込んでいるが、実際に動くか？
         //let mut rx = vec![0u8; rx_len];
         let mut rx = [0u8; 256];
         let rlen = self.bus.ctrl_rx(&mut rx).map_err(CtrlMsgError::Bus)?;
+
+        // debug
+        //println!("[ctrl_msg] rx ok len={}", rlen);
 
         // debug
         //dump_hex("CTRL_MSG WB", &tx);
@@ -146,7 +172,8 @@ impl<B: BusOps> IT930x<B> {
         }
 
         let frame_len = rx[0] as usize + 1;
-        if frame_len < 5 || frame_len > rlen {
+        //if frame_len < 5 || frame_len > rlen {
+        if frame_len != rlen {
             return Err(CtrlMsgError::InvalidLength);
         }
 
@@ -256,11 +283,6 @@ impl<B: BusOps> IT930x<B> {
 
         // チェック
         let new_val = (old & !mask) | (val & mask);
-
-        // 変化がない場合は書き込まない (USB負荷軽減)
-        if new_val == old {
-            return Ok(());
-        }
 
         // 1byte 書き込み
         self.write_regs(reg, &[new_val])?;
@@ -399,12 +421,14 @@ impl<B: BusOps> IT930x<B> {
 
     // it930x.c 619〜630 をそのまま移植
     pub fn raise(&self) -> Result<(), CtrlMsgError> {
+        // debug
+        println!("[it930x] raise()");
         let mut last_err = None;
 
-        for i in 0..5 {
+        for _ in 0..5 {
             // readチェックのみ
             match self.read_firmware_version() {
-                Ok(u32) => return Ok(()),
+                Ok(_) => return Ok(()),
                 Err(e) => last_err = Some(e),
             }
         }
@@ -425,6 +449,9 @@ impl<B: BusOps> IT930x<B> {
 
     // it930x.c 632 〜 752 の移植
     pub fn load_firmware<P: AsRef<Path>>(&self, path: P) -> Result<(), CtrlMsgError> {
+        // debug
+        println!("[it930x] load_firmware()");
+
         // 1. firmware がロード済みか確認
         let fw_version = self.read_firmware_version()?;
         if fw_version != 0 {
@@ -597,6 +624,9 @@ impl<B: BusOps> IT930x<B> {
     }
 
     pub fn init_warm(&self) -> Result<(), CtrlMsgError> {
+        // debug
+        println!("[it930x] init_warm()");
+
         self.write_regs(0x4976, &[0])?;
         self.write_regs(0x4bfb, &[0])?;
         self.write_regs(0x4978, &[0])?;
@@ -638,6 +668,9 @@ impl<B: BusOps> IT930x<B> {
         mode: GpioMode,
         enable: bool,
     ) -> Result<(), CtrlMsgError> {
+        // debug
+        println!("[it930x] set_gpio_mode()");
+
         const GPIO_EN_REGS: [u32; 16] = [
             0xd8b0, 0xd8b8, 0xd8b4, 0xd8c0, 0xd8bc, 0xd8c8, 0xd8c4, 0xd8d0, 0xd8cc, 0xd8d8, 0xd8d4,
             0xd8e0, 0xd8dc, 0xd8e4, 0xd8e8, 0xd8ec,
@@ -656,10 +689,12 @@ impl<B: BusOps> IT930x<B> {
 
         let mut status = self.gpio_status.lock().unwrap();
 
-        if status[idx].mode != mode {
-            status[idx].mode = mode;
-            self.write_regs(GPIO_EN_REGS[idx], &[val])?;
+        if status[idx].mode == mode {
+            return Ok(());
         }
+
+        status[idx].mode = mode;
+        self.write_regs(GPIO_EN_REGS[idx], &[val])?;
 
         if enable && !status[idx].enable {
             status[idx].enable = true;
@@ -732,6 +767,9 @@ impl<B: BusOps> IT930x<B> {
     }
 
     pub fn write_gpio(&self, gpio: i32, high: bool) -> Result<(), CtrlMsgError> {
+        // debug
+        println!("[it930x] write_gpio()");
+
         const GPIO_O_REGS: [u32; 16] = [
             0xd8af, 0xd8b7, 0xd8b3, 0xd8bf, 0xd8bb, 0xd8c7, 0xd8c3, 0xd8cf, 0xd8cb, 0xd8d7, 0xd8d3,
             0xd8df, 0xd8db, 0xd8e3, 0xd8e7, 0xd8eb,
@@ -755,9 +793,79 @@ impl<B: BusOps> IT930x<B> {
         Ok(())
     }
 
+    pub fn set_pid_filter(
+        &self,
+        input_idx: usize,
+        filter: Option<&PidFilter>,
+    ) -> Result<(), CtrlMsgError> {
+        // debug
+        println!("[it930x] set_pid_filter()");
+
+        // 各ポートに対応するレジスタ配列
+        const REMAP_MODE_REGS: [u32; 5] = [0xda13, 0xda25, 0xda29, 0xda2d, 0xda7f];
+        const PID_INDEX_REGS: [u32; 5] = [0xda15, 0xda26, 0xda2a, 0xda2e, 0xda80];
+
+        // 境界チェック (Cの input_idx < 0 || input_idx > 4 に相当)
+        if input_idx >= 5 {
+            return Err(CtrlMsgError::InvalidArgument);
+        }
+
+        // ポート番号の取得 (Cの it930x->config.input[input_idx].port_number)
+        // it930x.rsの定義に合わせて inputs を使用
+        let port = self.config.inputs[input_idx].port_number as usize;
+        if port >= 5 {
+            return Err(CtrlMsgError::InvalidDeviceState(format!(
+                "Invalid port number: {}",
+                port
+            )));
+        }
+
+        // フィルターが無効、またはPIDリストが空の場合 (Cの !filter || !filter->num に相当)
+        if filter.is_none() || filter.unwrap().pids.is_empty() {
+            /* disable pid filter */
+            self.write_regs(REMAP_MODE_REGS[port], &[0])?;
+
+            /* sync_byte only */
+            self.write_regs(0xda73 + port as u32, &[1])?;
+
+            return Ok(());
+        }
+
+        let filter = filter.unwrap();
+
+        // 各PIDをハードウェアフィルタに登録
+        for (i, &pid) in filter.pids.iter().enumerate() {
+            let data = [(pid & 0xff) as u8, ((pid >> 8) & 0xff) as u8];
+
+            /* target pid */
+            self.write_regs(0xda16, &data)?;
+
+            /* enable */
+            self.write_regs(0xda14, &[1])?;
+
+            /* index */
+            // ハードウェア側のインデックスレジスタは1バイト書き込みのため u8 にキャスト
+            self.write_regs(PID_INDEX_REGS[port], &[i as u8])?;
+        }
+
+        /* block or pass */
+        let remap_mode = if filter.block { 0 } else { 2 };
+        self.write_regs(REMAP_MODE_REGS[port], &[remap_mode])?;
+
+        /* sync_byte and remap */
+        self.write_regs(0xda73 + port as u32, &[3])?;
+
+        /* pid offset */
+        self.write_regs(0xda81 + (port as u32 * 2), &[0, 0])?;
+
+        Ok(())
+    }
+
     pub fn purge_psb(&self, timeout: std::time::Duration) -> Result<(), CtrlMsgError> {
         // USB接続であるか確認 (BusOpsトレイトでチェック可能にするのがベストです)
         // ここでは便宜上、条件を満たしている前提とします
+        // debug
+        println!("[it930x] call purge_psb()");
 
         // 1. レジスタ操作によるPSBパージの有効化
         self.write_reg_mask(0xda1d, 0x01, 0x01)?;
@@ -792,6 +900,7 @@ impl<B: BusOps> IT930x<B> {
     where
         F: Fn(&[u8]) + Send + Sync + 'static,
     {
+        println!("[it930x] Start streaming via bus.");
         self.bus
             .start_streaming(Box::new(handler))
             .map_err(CtrlMsgError::Bus)

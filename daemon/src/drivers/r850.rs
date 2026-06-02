@@ -3421,6 +3421,9 @@ impl<'a, B: BusOps> R850<'a, B> {
 
     // 0〜3 の範囲で水晶発振器のパワー設定を変えながら PLL がロックするかどうかテストし、最適なパワー設定値を探し出す。
     pub fn check_xtal_power(&self, priv_data: &mut R850Priv) -> Result<(), CtrlMsgError> {
+        // debug
+        println!("[R850] call check_xtal_power().");
+
         let bank = 55u8;
         let mut pwr = 3u8; // xtal 24MHz
 
@@ -3489,6 +3492,9 @@ impl<'a, B: BusOps> R850<'a, B> {
         tc90522_addr: u8,
         is_secondary: bool,
     ) -> Result<Self, TunerError> {
+        // debug
+        println!("[R850] new()");
+
         let tc90522 = TC90522::new(
             it930x,
             tc90522_bus,
@@ -3582,8 +3588,8 @@ impl<'a, B: BusOps> R850<'a, B> {
 
         // debug
         println!(
-            "[debug] r850.sleep chip={:?} loop_through={} r08=0x{:02x}",
-            priv_data.chip, self.config.loop_through, priv_data.regs[0x08]
+            "[debug] r850.sleep chip={:?} loop_through={} i2c_addr={:02X} r08=0x{:02x}",
+            priv_data.chip, self.config.loop_through, self.i2c_addr, priv_data.regs[0x08]
         );
 
         self.write_regs(0x08, &priv_data.regs[0x08..R850_NUM_REGS])?;
@@ -3716,6 +3722,9 @@ impl<'a, B: BusOps> R850<'a, B> {
 impl<'a, B: BusOps> Tuner for R850<'a, B> {
     // 初期化処理
     fn init(&mut self) -> Result<(), TunerError> {
+        // debug
+        println!("[RT710] init()");
+
         // 初期状態の設定
         let mut priv_data = self.priv_.lock().unwrap();
 
@@ -3774,12 +3783,21 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
 
         priv_data.init = true;
 
+        // いらないのでは？
+        println!(
+            "R850 init done. chip: {:?}, reg08=0x{:02x}",
+            priv_data.chip, regs[0]
+        );
+
         Ok(())
     }
 
     // デバイスの利用を開始する
     // px4_device.c の一部の機能を切り出し
     fn open(&self) -> Result<(), TunerError> {
+        // debug
+        println!("[R850] call open().");
+
         // 1. 個別ウェイクアップレジスタ (tc_init_t) の書き込み
         self.tc90522.write_multiple_regs(&TC_INIT_T)?;
 
@@ -3807,6 +3825,9 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
     // デバイスの利用を終了する
     // px4_device.c の一部の機能を切り出し
     fn close(&self) -> Result<(), TunerError> {
+        // debug
+        println!("[R850] call close().");
+
         let mut priv_data = self.priv_.lock().unwrap();
 
         // 逆の順序で終了させる
@@ -3832,6 +3853,9 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
     }
 
     fn tune(&mut self, freq: u32) -> Result<(), TunerError> {
+        // debug
+        println!("[R850] tune(): freq = {}", freq);
+
         // px4_device.c のコードの一部を切り出して、R850の役割として貼り付け
         // px4_chrdev_tune_t() の移植
         // 1. AGC設定
