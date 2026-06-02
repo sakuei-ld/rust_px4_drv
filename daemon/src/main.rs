@@ -1,8 +1,10 @@
+use bytes::Bytes;
 use crossbeam_channel::RecvTimeoutError;
 use rusb::{Context, UsbContext};
-use std::io::{BufRead, BufReader, Write};
+
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::{Arc, Mutex, TryLockResult};
+use std::sync::{Arc, Mutex};
 
 // 既存のドライバをインポート
 use rust_px4_drv_daemon::drivers::it930x::IT930x;
@@ -197,12 +199,14 @@ fn main() -> anyhow::Result<()> {
 // クライアントからの要求処理(受信メインループ)
 fn handle_client<B: BusOps + Send + Sync>(
     mut stream: UnixStream,
-    receivers: Arc<Vec<crossbeam_channel::Receiver<Vec<u8>>>>,
+    receivers: Arc<Vec<crossbeam_channel::Receiver<Bytes>>>,
     px4_device: Arc<Mutex<Px4Device<B>>>, // ドライバの共有参照
 ) {
     println!("[client] Connected.");
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
+
+    let mut writer = BufWriter::with_capacity(128 * 1024, stream.try_clone().unwrap());
 
     // クライアントの接続ライフサイクルを管理するガード
     let mut guard = ClientGuard {
@@ -418,7 +422,7 @@ fn handle_client<B: BusOps + Send + Sync>(
                                         match rx.recv_timeout(std::time::Duration::from_millis(500))
                                         {
                                             Ok(packet) => {
-                                                if stream.write_all(&packet).is_err() {
+                                                if writer.write_all(&packet).is_err() {
                                                     println!("[client] stream closed.");
                                                     break;
                                                 }

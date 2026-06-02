@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
@@ -199,7 +198,6 @@ pub struct RT710<'a, B: BusOps> {
     pub i2c_addr: u8,
     config: RT710Config,
     priv_: Mutex<RT710Priv>,
-    is_initialized: AtomicBool,
 }
 
 impl<'a, B: BusOps> RT710<'a, B> {
@@ -397,7 +395,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
             it930x,
             tc90522_bus,
             tc90522_addr,
-            System::ISDB_S,
+            System::IsdbS,
             is_secondary,
         );
 
@@ -425,7 +423,6 @@ impl<'a, B: BusOps> RT710<'a, B> {
                 freq: 0,
                 chip: RT710ChipType::RT710,
             }),
-            is_initialized: AtomicBool::new(false),
         })
     }
 

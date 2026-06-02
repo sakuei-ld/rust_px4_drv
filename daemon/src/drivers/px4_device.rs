@@ -1,18 +1,19 @@
-//use std::sync::mpsc::{channel, Receiver, Sender};
+use bytes::{Buf, Bytes, BytesMut};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::drivers::it930x::{CtrlMsgError, GpioMode, IT930x, PidFilter};
 use crate::drivers::itedtv_bus::BusOps;
 use crate::drivers::r850::R850;
 use crate::drivers::rt710::RT710;
 use crate::drivers::tc90522::{System, TunerError};
 
-use crate::drivers::it930x::{CtrlMsgError, GpioMode, IT930x, PidFilter};
-
 const PX4_DEVICE_TS_SYNC_COUNT: usize = 4;
 const PX4_DEVICE_TS_SYNC_SIZE: usize = 188 * PX4_DEVICE_TS_SYNC_COUNT;
 
+// Q3U4 で必要そう
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Px4MldevMode {
     All,
@@ -57,30 +58,35 @@ struct ChrdevConfig {
 // S1UR とか Q3U4 のときは知らないが、Q3U4 は多分、これで良い。(これの外側で2つ持つイメージだと思う)
 const PX4_CHRDEV_CONFIGS: [ChrdevConfig; 4] = [
     ChrdevConfig {
-        system: System::ISDB_S,
+        system: System::IsdbS,
         addr: 0x11,
         is_secondary: false,
         options: 0, // px4_device.c 1263行目参照
     },
     ChrdevConfig {
-        system: System::ISDB_S,
+        system: System::IsdbS,
         addr: 0x13,
         is_secondary: true,
         options: 0,
     },
     ChrdevConfig {
-        system: System::ISDB_T,
+        system: System::IsdbT,
         addr: 0x10,
         is_secondary: false,
         options: 0x00000080, // px4_device.c 1258行目参照
     },
     ChrdevConfig {
-        system: System::ISDB_T,
+        system: System::IsdbT,
         addr: 0x12,
         is_secondary: true,
         options: 0x00000080,
     },
 ];
+
+pub enum TunerInstance<'a, B: BusOps> {
+    Satellite(RT710<'a, B>),
+    Terrestrial(R850<'a, B>),
+}
 
 pub trait Tuner {
     // チューナー初期化
@@ -108,29 +114,95 @@ pub trait Tuner {
         Err(TunerError::InvalidState)
     }
 
-    fn dump_regs(&mut self, _start: u8, _end: u8) -> Result<(), TunerError> {
-        Err(TunerError::InvalidState)
-    }
-
     // 論理的な終了処理
     // 各チューナーチップが「電源が落とされた」ことを認識し、内部状態をリセットするためのメソッド
     fn term(&mut self) -> Result<(), TunerError>;
 }
 
-pub struct Px4Chrdev<'a> {
+impl<'a, B: BusOps> Tuner for TunerInstance<'a, B> {
+    fn init(&mut self) -> Result<(), TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.init(),
+            TunerInstance::Terrestrial(t) => t.init(),
+        }
+    }
+
+    fn init_0(&self) -> Result<(), TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.init_0(),
+            TunerInstance::Terrestrial(t) => t.init_0(),
+        }
+    }
+
+    fn open(&self) -> Result<(), TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.open(),
+            TunerInstance::Terrestrial(t) => t.open(),
+        }
+    }
+
+    fn close(&self) -> Result<(), TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.close(),
+            TunerInstance::Terrestrial(t) => t.close(),
+        }
+    }
+
+    fn tune(&mut self, freq: u32) -> Result<(), TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.tune(freq),
+            TunerInstance::Terrestrial(t) => t.tune(freq),
+        }
+    }
+
+    fn is_locked(&self) -> Result<bool, TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.is_locked(),
+            TunerInstance::Terrestrial(t) => t.is_locked(),
+        }
+    }
+
+    fn enable_ts_pins(&mut self, enable: bool) -> Result<(), TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.enable_ts_pins(enable),
+            TunerInstance::Terrestrial(t) => t.enable_ts_pins(enable),
+        }
+    }
+
+    fn read_cnr_raw(&self) -> Result<u32, TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.read_cnr_raw(),
+            TunerInstance::Terrestrial(t) => t.read_cnr_raw(),
+        }
+    }
+
+    fn set_stream_id(&mut self, stream_id: u16) -> Result<(), TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.set_stream_id(stream_id),
+            TunerInstance::Terrestrial(t) => t.set_stream_id(stream_id),
+        }
+    }
+
+    fn term(&mut self) -> Result<(), TunerError> {
+        match self {
+            TunerInstance::Satellite(t) => t.term(),
+            TunerInstance::Terrestrial(t) => t.term(),
+        }
+    }
+}
+
+pub struct Px4Chrdev<T: Tuner> {
+    // BS/GR
     pub system: System,
 
-    // ここ3つは要らない気がする。
-    // → IT930x内部に記載して良さげ。
+    // チューナー idx
     pub port_number: u8,
-    pub slave_number: u8,
-    pub sync_byte: u8,
 
     // アプリケーション層へデータを送るためのキュー
-    pub tx: Sender<Vec<u8>>,
+    pub tx: Sender<Bytes>,
 
-    //pub tc90522: &'a TC90522<'a, B>,
-    pub tuner: Box<dyn Tuner + Send + Sync + 'a>,
+    // チューナー
+    pub tuner: T,
 
     // オープン状態かのフラグ
     pub is_opened: bool,
@@ -142,11 +214,136 @@ pub struct Px4Chrdev<'a> {
     pub lnb_power: bool,
 }
 
-impl<'a> Px4Chrdev<'a> {
-    /// 188バイトのTSパケットを配信する
-    pub fn put_stream(&self, packet: &[u8]) {
-        // チャンネルが生きている場合のみ送信（エラーは無視、またはログ出力）
-        let _ = self.tx.send(packet.to_vec());
+// 各ポートの情報と、一括送信用の一時バッファ（バケツ）を管理する構造体
+struct TargetPort {
+    port_number: u8,
+    tx: Sender<Bytes>,
+    // ポートごとの一括送信用バッファ
+    buffer: BytesMut,
+}
+
+// ストリーム処理部分
+struct Px4StreamContext {
+    pub targets: Vec<TargetPort>,
+    // バッチ送信用のアロケーション使い回しバッファ
+    pub stream_buffer: BytesMut,
+}
+
+impl Px4StreamContext {
+    pub fn new<T: Tuner>(chrdevs: &[Px4Chrdev<T>]) -> Self {
+        let targets = chrdevs
+            .iter()
+            .map(|c| TargetPort {
+                port_number: c.port_number,
+                tx: c.tx.clone(),
+                buffer: BytesMut::with_capacity(32 * 1024),
+            })
+            .collect();
+
+        Self {
+            targets,
+            // 64KB分を事前に確保。以降、キャパシティを超えない限りアロケーションは発生しない
+            stream_buffer: BytesMut::with_capacity(64 * 1024),
+        }
+    }
+
+    /// USBから読んだバルクデータ(bulk_buf)を処理する
+    pub fn process_stream(&mut self, data: &[u8]) {
+        // 各ポートの一時バッファをクリア（確保済みのメモリ枠は維持）
+        for t in &mut self.targets {
+            t.buffer.clear();
+        }
+
+        // 新しいデータをバッファに結合
+        self.stream_buffer.extend_from_slice(data);
+
+        // 752 byte (4パケット分) 以上ある間、同期チェックと切り出しをループ
+        let mut offset = 0;
+        while offset + PX4_DEVICE_TS_SYNC_SIZE <= self.stream_buffer.len() {
+            let mut is_synced = true;
+            for i in 0..PX4_DEVICE_TS_SYNC_COUNT {
+                if (self.stream_buffer[offset + i * 188] & 0x8f) != 0x07 {
+                    is_synced = false;
+                    break;
+                }
+            }
+
+            if !is_synced {
+                offset += 1;
+                continue;
+            }
+
+            // 同期が取れたら、188 byte 単位でパケットを切り出し
+            while offset + 188 <= self.stream_buffer.len()
+                && (self.stream_buffer[offset] & 0x8f) == 0x07
+            {
+                let id = (self.stream_buffer[offset] & 0x70) >> 4;
+
+                if id > 0 && id < 5 {
+                    // 同期バイトを 0x47 に書き換え
+                    self.stream_buffer[offset] = 0x47;
+                    let packet = &self.stream_buffer[offset..offset + 188];
+
+                    // 【最適化】クロージャの find をやめ、単純なループで比較 (O(N)の高速化)
+                    for t in &mut self.targets {
+                        if t.port_number == id {
+                            t.buffer.extend_from_slice(packet);
+                            break;
+                        }
+                    }
+                }
+                offset += 188;
+            }
+        }
+
+        // データの削除（drainはメモリ枠を維持するため高速）
+        //self.stream_buffer.drain(0..offset);
+        // 読み取り開始位置(ポインタ)を offset 分進める
+        self.stream_buffer.advance(offset);
+
+        // 溜まったパケットをポートごとに一括送信
+        for t in &mut self.targets {
+            if !t.buffer.is_empty() {
+                // split().freeze() によるゼロコピー送信
+                // t.buffer の中身を切り出し、データのコピーを一切行わずに送信用のイミュータブルな Bytes に変換
+                let batch = t.buffer.split().freeze();
+
+                // try_send() で、受信側が詰まっていても USB受信スレッドをブロックさせない
+                match t.tx.try_send(batch) {
+                    Ok(_) => {}
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        eprintln!(
+                            "[Warning] Port {} channel full. Dropped batch.",
+                            t.port_number
+                        );
+                    }
+                    // クライアント切断時など
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+}
+
+impl<T: Tuner> Px4Chrdev<T> {
+    // 複数のTSパケット(188 byte x N)がまとまったバッファを一括送信する
+    pub fn put_stream_batch(&self, batch: &[u8]) {
+        if batch.is_empty() {
+            return;
+        }
+
+        // try_send() で、受信側が詰まっていても USB受信スレッドをブロックさせずに、古いパケットを破棄
+        match self.tx.try_send(Bytes::copy_from_slice(batch)) {
+            Ok(_) => {}
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                // ここで警告ログを出すと、バッファサイズ不足かI/O遅延かを可視化できる
+                // あとで、eprintln! にする
+                println!("[Warning] Channel is full, dropping {} bytes", batch.len());
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                // クライアントが切断された場合の処理
+            }
+        }
     }
 
     pub fn open(&mut self) -> Result<(), TunerError> {
@@ -154,9 +351,6 @@ impl<'a> Px4Chrdev<'a> {
 
         // トレイトオブジェクト経由でチューナーを開く
         self.tuner.open()?;
-
-        // 3. USBブリッジ（IT930x）側のストリーミングを開始（必要に応じて実装）
-        // self.it930x.start_stream(self.port_number)?;
 
         Ok(())
     }
@@ -169,15 +363,11 @@ impl<'a> Px4Chrdev<'a> {
     pub fn set_stream_id(&mut self, streamd_id: u16) -> Result<(), TunerError> {
         self.tuner.set_stream_id(streamd_id)
     }
-
-    pub fn dump_regs(&mut self, start: u8, end: u8) -> Result<(), TunerError> {
-        self.tuner.dump_regs(start, end)
-    }
 }
 
 pub struct Px4Device<'a, B: BusOps + Sync> {
     it930x: &'a IT930x<B>,
-    px4chrdev: Vec<Px4Chrdev<'a>>,
+    px4chrdev: Vec<Px4Chrdev<TunerInstance<'a, B>>>,
 
     open_count: usize,
     lnb_power_count: usize,
@@ -190,7 +380,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         it930x: &'a IT930x<B>,
         use_mldev: bool,
         discard_null_packets: bool,
-    ) -> Result<(Self, Vec<Receiver<Vec<u8>>>), TunerError> {
+    ) -> Result<(Self, Vec<Receiver<Bytes>>), TunerError> {
         // px4_device_init() の処理
 
         // 一応、オリジナルでは、ここで parse_serial_number() を走らせる。
@@ -227,12 +417,12 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         it930x.write_gpio(11, false)?;
 
         // NULLパケット (PID: 0x1fff) の破棄設定
-        // 【修正点①】Nullパケット (PID: 0x1fff) の破棄設定
         if discard_null_packets {
             let filter = PidFilter {
                 pids: vec![0x1fff],
                 block: true,
             };
+
             // PX4_CHRDEV_CONFIGS の数（通常4つ）だけループしてフィルターを適用
             for i in 0..PX4_CHRDEV_CONFIGS.len() {
                 it930x
@@ -261,28 +451,32 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             //tc90522s.push(tc90522);
 
             // 1. Tuner構造体を作成
-            let mut tuner_box: Box<dyn Tuner + Send + Sync> = match config.system {
-                System::ISDB_S => {
-                    Box::new(RT710::new(&it930x, 2, config.addr, config.is_secondary)?)
-                }
-                System::ISDB_T => {
-                    Box::new(R850::new(&it930x, 2, config.addr, config.is_secondary)?)
-                }
+            let tuner = match config.system {
+                System::IsdbS => TunerInstance::Satellite(RT710::new(
+                    &it930x,
+                    2,
+                    config.addr,
+                    config.is_secondary,
+                )?),
+                System::IsdbT => TunerInstance::Terrestrial(R850::new(
+                    &it930x,
+                    2,
+                    config.addr,
+                    config.is_secondary,
+                )?),
             };
 
             // ここでチャンネル(送信・受信のペア)を生成
             //let (tx, rx) = channel();
-            let (tx, rx) = unbounded::<Vec<u8>>();
+            let (tx, rx) = unbounded::<Bytes>();
             // 受信側 (rx) はリストに保存して最後に init の戻り値として返す
             receivers.push(rx);
 
             px4chrdev.push(Px4Chrdev {
                 system: config.system,
                 port_number: i as u8 + 1,
-                slave_number: i as u8,
-                sync_byte: ((i as u8 + 1) << 4) | 0x07,
                 tx,
-                tuner: tuner_box,
+                tuner: tuner,
                 is_opened: false,
                 is_streaming: false,
                 lnb_power: false,
@@ -333,27 +527,27 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         );
 
         // 一応、ISDB-T はスルーするようにしておく
-        if self.px4chrdev[target_idx].system == System::ISDB_T {
+        if self.px4chrdev[target_idx].system == System::IsdbT {
             return Ok(());
         }
 
-        // 1. バリデーション (0V か 15V 以外は無効)
+        // バリデーション (0V か 15V 以外は無効)
         if voltage != 0 && voltage != 15 {
             return Err(TunerError::InvalidArgument);
         }
 
         let is_on = voltage == 15;
 
-        // 2. 既に要求された状態と同じなら何もしない
+        // 既に要求された状態と同じなら何もしない
         if self.px4chrdev[target_idx].lnb_power == is_on {
             return Ok(());
         }
 
         // Cコードの !voltage && !atomic_read(&px4->available) の条件は、
-        // ユーザスペースドライバとしてデバイスオブジェクトが生きていれば不要なため省略します。
+        // ユーザスペースドライバとしてデバイスオブジェクトが生きていれば不要なため省略
 
         if !is_on {
-            // ---- OFF にする処理 ----
+            // OFF にする処理
             if self.lnb_power_count > 0 {
                 self.lnb_power_count -= 1;
             }
@@ -369,8 +563,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             // フラグをOFFに更新
             self.px4chrdev[target_idx].lnb_power = false;
         } else {
-            // ---- ON にする処理 ----
-            // 最初の1基目がONになるタイミングで、GPIO 11 を HIGH に引き上げる
+            // ON にする処理(最初の1基目がONになるタイミングで、GPIO 11 を HIGH に引き上げる)
             if self.lnb_power_count == 0 {
                 // ONにする際のエラーは致命的なため、? で即座にエラーを返して状態を更新しない
                 self.it930x.write_gpio(11, true)?;
@@ -467,20 +660,20 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             self.px4chrdev[target_idx].is_streaming = false;
         }
 
-        // ISDB_S（BS/CS）の場合は、チューナーを閉じる前にLNB電源を確実に落とす
-        if self.px4chrdev[target_idx].system == System::ISDB_S {
+        // IsdbS（BS/CS）の場合は、チューナーを閉じる前にLNB電源を確実に落とす
+        if self.px4chrdev[target_idx].system == System::IsdbS {
             if let Err(e) = self.set_lnb_voltage(target_idx, 0) {
                 println!("[error] Failed to stop LNB voltage during close: {:?}", e);
             }
         }
 
-        // 1. まずは対象のチャンネルのハードウェアをスリープさせる
+        // まずは対象のチャンネルのハードウェアをスリープさせる
         self.px4chrdev[target_idx].tuner.close()?;
         self.px4chrdev[target_idx].is_opened = false;
 
         self.open_count -= 1;
 
-        // 2. もし最後のチャンネルが閉じられたなら、エコモード（電源OFF）に移行する
+        // もし最後のチャンネルが閉じられたなら、エコモード（電源OFF）に移行する
         if self.open_count == 0 {
             println!("All tuners closed. Powering off backend hardware...");
 
@@ -489,7 +682,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
                 chrdev.tuner.term()?;
             }
 
-            // 【最重要】基板全体の電源を落とす
+            // 基板全体の電源を落とす
             self.backend_set_power(false)?;
         }
 
@@ -510,10 +703,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     pub fn start_capture(&mut self, target_idx: usize) -> Result<(), TunerError> {
-        // 1. チューナー固有のTS出力ピンを有効化 (成功すれば後で失敗時に無効化する)
-        //self.px4chrdev[target_idx].tuner.enable_ts_pins(true)?;
-
-        // 2. ストリーミングがまだ始まっていなければ、ブリッジ全体の準備をする
+        // ストリーミングがまだ始まっていなければ、ブリッジ全体の準備をする
         if self.streaming_count == 0 {
             // purge
             if let Err(e) = self.it930x.purge_psb(Duration::from_millis(2000)) {
@@ -524,68 +714,19 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             }
         }
 
-        // 順序が違うらしいので
+        // TS出力ピン有効化
         self.px4chrdev[target_idx].tuner.enable_ts_pins(true)?;
 
         if self.streaming_count == 0 {
-            // 全ポートの「Sender(tx)」と「port_number」のリストだけをクローン
-            // クロージャの中に move
-            let mut dispatch_targets: Vec<(u8, Sender<Vec<u8>>)> = self
-                .px4chrdev
-                .iter()
-                .map(|c| (c.port_number, c.tx.clone()))
-                .collect();
-
-            // 柔軟な残差処理のため、バッファもスレッド側へ
-            let stream_buffer = Mutex::new(Vec::with_capacity(1024 * 64));
+            // Px4StreamContext を生成し、1つの Mutex で包む
+            let stream_ctx = Px4StreamContext::new(&self.px4chrdev);
+            let ctx_mutex = Mutex::new(stream_ctx);
 
             // ストリームハンドラの開始
             if let Err(e) = self.it930x.start_streaming(move |data| {
-                // Mutex のロックを取得して、内部バッファを可変として取り出す
-                let mut stream_buffer = stream_buffer.lock().unwrap();
-
-                // 1. 新しいデータをバッファに結合
-                stream_buffer.extend_from_slice(data);
-
-                // 2. 752 byte (4パケット分) 以上ある間、同期チェックと切り出しをループ
-                let mut offset = 0;
-                while offset + PX4_DEVICE_TS_SYNC_SIZE <= stream_buffer.len() {
-                    let mut is_synced = true;
-                    for i in 0..PX4_DEVICE_TS_SYNC_COUNT {
-                        if (stream_buffer[offset + i * 188] & 0x8f) != 0x07 {
-                            is_synced = false;
-                            break;
-                        }
-                    }
-
-                    if !is_synced {
-                        offset += 1;
-                        continue;
-                    }
-
-                    // 同期が取れたら、188 byte 単位でパケットを切り出して Sender に分配
-                    while offset + 188 <= stream_buffer.len()
-                        && (stream_buffer[offset] & 0x8f) == 0x07
-                    {
-                        let id = (stream_buffer[offset] & 0x70) >> 4;
-
-                        if id > 0 && id < 5 {
-                            // 同期バイトを 0x47 に書き換え
-                            stream_buffer[offset] = 0x47;
-                            let packet = &stream_buffer[offset..offset + 188];
-
-                            // 対応するポートにデータを送信 (C の dispatch_packet の役割も内包)
-                            if let Some((_, tx)) =
-                                dispatch_targets.iter().find(|(port, _)| *port == id)
-                            {
-                                let _ = tx.send(packet.to_vec());
-                            }
-                        }
-                        offset += 188;
-                    }
-                }
-
-                stream_buffer.drain(0..offset);
+                // USB受信1回につき、ロックの取得はこれ1回だけ
+                let mut ctx = ctx_mutex.lock().unwrap();
+                ctx.process_stream(data);
             }) {
                 let _ = self.px4chrdev[target_idx].tuner.enable_ts_pins(false);
                 return Err(e.into());
@@ -604,17 +745,18 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         }
 
         if self.streaming_count == 0 {
-            return Err(TunerError::InvalidState); // EALREADY相当
+            // EALREADY相当
+            return Err(TunerError::InvalidState);
         }
 
         self.streaming_count -= 1;
 
-        // 1. 誰もストリーミングしていないなら、ブリッジ全体を停止
+        // 誰もストリーミングしていないなら、ブリッジ全体を停止
         if self.streaming_count == 0 {
             self.it930x.stop_streaming()?;
         }
 
-        // 2. チューナー固有のTS出力ピンを無効化
+        // チューナー固有のTS出力ピンを無効化
         self.px4chrdev[target_idx].tuner.enable_ts_pins(false)?;
 
         Ok(())
@@ -648,7 +790,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         Ok(())
     }
 
-    // 使わなくいいかも？
+    // 使わなくていいかも？
     pub fn parse_serial_number(serial_str: &str) -> Result<(u64, u8), CtrlMsgError> {
         if serial_str.len() != 15 {
             return Err(CtrlMsgError::InvalidArgument);
@@ -716,7 +858,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         }
 
         Ok(((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000010) != 0)
-            && (PX4_CHRDEV_CONFIGS[target_idx].system == System::ISDB_S))
+            && (PX4_CHRDEV_CONFIGS[target_idx].system == System::IsdbS))
     }
 
     pub fn is_wait_after_check_lock(&mut self, target_idx: usize) -> Result<bool, TunerError> {
@@ -726,7 +868,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         }
 
         Ok(((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000080) != 0)
-            && (PX4_CHRDEV_CONFIGS[target_idx].system == System::ISDB_T))
+            && (PX4_CHRDEV_CONFIGS[target_idx].system == System::IsdbT))
     }
 
     pub fn is_set_stream_id_after_tune(&mut self, target_idx: usize) -> Result<bool, TunerError> {
@@ -736,7 +878,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         }
 
         Ok(((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000010) == 0)
-            && (PX4_CHRDEV_CONFIGS[target_idx].system == System::ISDB_S))
+            && (PX4_CHRDEV_CONFIGS[target_idx].system == System::IsdbS))
     }
 
     pub fn is_wait_after_lock(&mut self, target_idx: usize) -> Result<bool, TunerError> {
@@ -747,11 +889,6 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
         Ok((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000040) != 0)
     }
-
-    // debug用
-    pub fn dump_regs(&mut self, target_idx: usize, start: u8, end: u8) -> Result<(), TunerError> {
-        self.px4chrdev[target_idx].dump_regs(start, end)
-    }
 }
 
 impl<'a, B: BusOps + Sync> Drop for Px4Device<'a, B> {
@@ -761,6 +898,5 @@ impl<'a, B: BusOps + Sync> Drop for Px4Device<'a, B> {
         if self.open_count > 0 {
             let _ = self.backend_set_power(false);
         }
-        // ここで it930x の終了処理 (Cコードの it930x_term) などを呼べれば呼びます
     }
 }

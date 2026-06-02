@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
@@ -1075,7 +1074,7 @@ pub const SYS_PARAMS: &[&[&[R850SystemParams]]] = &[
     &[&DVB_T2_1_PARAMS[0], &DVB_T2_1_PARAMS[1]], // 3: DVB_T2_1
     &[&DVB_C_PARAMS[0], &DVB_C_PARAMS[1]],       // 4: DVB_C
     &[&J83B_PARAMS[0], &J83B_PARAMS[1]],         // 5: J83B
-    &[&ISDB_T_PARAMS[0], &ISDB_T_PARAMS[1]],     // 6: ISDB_T
+    &[&ISDB_T_PARAMS[0], &ISDB_T_PARAMS[1]],     // 6: IsdbT
     &[&DTMB_PARAMS[0], &DTMB_PARAMS[1]],         // 7: DTMB
     &[&ATSC_PARAMS[0], &ATSC_PARAMS[1]],         // 8: ATSC
     &[&[], &[]],                                 // 9: FM
@@ -2046,7 +2045,7 @@ pub const SYS_FREQ_PARAMS: &[&[R850SystemFrequencyParams]] = &[
     &DVB_T_T2_FREQ_PARAMS, // 3: DVB_T2_1
     &DVB_C_FREQ_PARAMS,    // 4: DVB_C
     &J83B_FREQ_PARAMS,     // 5: J83B
-    &ISDB_T_FREQ_PARAMS,   // 6: ISDB_T
+    &ISDB_T_FREQ_PARAMS,   // 6: IsdbT
     &DTMB_FREQ_PARAMS,     // 7: DTMB
     &ATSC_FREQ_PARAMS,     // 8: ATSC
     &[],                   // 9: FM
@@ -2065,7 +2064,6 @@ pub struct R850<'a, B: BusOps> {
 
     pub i2c_addr: u8,
     priv_: Mutex<R850Priv>,
-    is_initialized: AtomicBool,
 }
 
 impl<'a, B: BusOps> R850<'a, B> {
@@ -2253,7 +2251,7 @@ impl<'a, B: BusOps> R850<'a, B> {
                     xtal_div = 1;
                 }
             } else if (478000..=481999).contains(&(lo_freq + if_freq)) && sys == R850System::IsdbT {
-                // ((lo_freq + if_freq - 478000) < 4000 && sys == R850_SYSTEM_ISDB_T)
+                // ((lo_freq + if_freq - 478000) < 4000 && sys == R850_SYSTEM_IsdbT)
                 xtal /= 4;
                 priv_data.regs[0x22] |= 0x03;
                 xtal_div = 3;
@@ -3181,7 +3179,7 @@ impl<'a, B: BusOps> R850<'a, B> {
         Ok(())
     }
 
-    // 選局時に呼ばれる処理で、要求された周波数（rf_freq）に合致するパラメータを SYS_FREQ_PARAMS（ISDB_T_FREQ_PARAMS など）から探し出し、LNA（低雑音増幅器）やミキサーのゲイン・電圧設定を反映させた上で、最終的に set_mux と set_pll を呼び出して周波数をロックする。
+    // 選局時に呼ばれる処理で、要求された周波数（rf_freq）に合致するパラメータを SYS_FREQ_PARAMS（IsdbT_FREQ_PARAMS など）から探し出し、LNA（低雑音増幅器）やミキサーのゲイン・電圧設定を反映させた上で、最終的に set_mux と set_pll を呼び出して周波数をロックする。
     fn set_system_frequency(
         &self,
         rf_freq: u32,
@@ -3499,7 +3497,7 @@ impl<'a, B: BusOps> R850<'a, B> {
             it930x,
             tc90522_bus,
             tc90522_addr,
-            System::ISDB_T,
+            System::IsdbT,
             is_secondary,
         );
 
@@ -3564,7 +3562,6 @@ impl<'a, B: BusOps> R850<'a, B> {
                 mixer_mode: 0,
                 mixer_amp_lpf_imr_cal: 0,
             }),
-            is_initialized: AtomicBool::new(false),
         })
     }
 
@@ -3811,7 +3808,7 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
         self.wakeup()?;
 
         // 5. 初期システム・帯域・IF周波数の設定 (Cコードの r850_set_system 相当)
-        // Cコード: sys.system = R850_SYSTEM_ISDB_T; sys.bandwidth = R850_BANDWIDTH_6M; sys.if_freq = 4063;
+        // Cコード: sys.system = R850_SYSTEM_IsdbT; sys.bandwidth = R850_BANDWIDTH_6M; sys.if_freq = 4063;
         let sytem_config = R850SystemConfig {
             system: R850System::IsdbT,
             bandwidth: R850Bandwidth::B6M,

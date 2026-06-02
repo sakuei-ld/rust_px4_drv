@@ -45,7 +45,7 @@ pub trait BusOps {
 
 // メモ: C の struct itedtv_bus に該当 するらしい
 pub struct UsbBusRusb {
-    handle: Arc<Mutex<DeviceHandle<Context>>>,
+    handle: Arc<DeviceHandle<Context>>, // Mutex は要らない、らしい
     ctrl_tx_ep: u8,
     ctrl_rx_ep: u8,
     stream_ep: u8,
@@ -61,12 +61,12 @@ pub struct UsbBusRusb {
 impl UsbBusRusb {
     pub fn new(handle: DeviceHandle<Context>) -> Result<Self, BusError> {
         // 一応、Linux向けに、OSの標準ドライバが掴んでいた場合に、切り離す
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(true) = handle.kernel_driver_activate(0) {
-                handle.detach_kernel_driver(0)?;
-            }
-        }
+        //#[cfg(target_os = "linux")]
+        //{
+        //    if let Ok(true) = handle.kernel_driver_activate(0) {
+        //        handle.detach_kernel_driver(0)?;
+        //    }
+        //}
 
         // interface を占有する。
         handle.claim_interface(0)?;
@@ -102,7 +102,7 @@ impl UsbBusRusb {
         );
 
         Ok(Self {
-            handle: Arc::new(Mutex::new(handle)),
+            handle: Arc::new(handle),
             ctrl_tx_ep: 0x02,
             ctrl_rx_ep: 0x81,
             stream_ep: 0x84,
@@ -118,8 +118,10 @@ impl UsbBusRusb {
 impl BusOps for UsbBusRusb {
     // itedtv_bus.c の 47〜70 と思われる。
     fn ctrl_tx(&self, buf: &[u8]) -> Result<(), BusError> {
-        let guarded_handle = self.handle.lock().unwrap();
-        guarded_handle.write_bulk(self.ctrl_tx_ep, buf, self.ctrl_timeout)?;
+        //let guarded_handle = self.handle.lock().unwrap();
+        //guarded_handle.write_bulk(self.ctrl_tx_ep, buf, self.ctrl_timeout)?;
+        self.handle
+            .write_bulk(self.ctrl_tx_ep, buf, self.ctrl_timeout)?;
 
         thread::sleep(Duration::from_millis(1));
         Ok(())
@@ -127,8 +129,9 @@ impl BusOps for UsbBusRusb {
 
     // itedtv_bus.c の 72〜97 と思われる。
     fn ctrl_rx(&self, buf: &mut [u8]) -> Result<usize, BusError> {
-        let guarded_handle = self.handle.lock().unwrap();
-        let read_len = guarded_handle.read_bulk(self.ctrl_rx_ep, buf, self.ctrl_timeout)?;
+        let read_len = self
+            .handle
+            .read_bulk(self.ctrl_rx_ep, buf, self.ctrl_timeout)?;
 
         thread::sleep(Duration::from_millis(1));
         Ok(read_len)
@@ -136,8 +139,7 @@ impl BusOps for UsbBusRusb {
 
     // itedtv_bus.c の 99〜118 と思われる。
     fn stream_rx(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, BusError> {
-        let guarded_handle = self.handle.lock().unwrap();
-        let size = guarded_handle.read_bulk(self.stream_ep, buf, timeout)?;
+        let size = self.handle.read_bulk(self.stream_ep, buf, timeout)?;
         Ok(size)
     }
 
@@ -156,13 +158,6 @@ impl BusOps for UsbBusRusb {
 
         println!("[usb_bus] Start stream...");
 
-        // 1. ハンドラをスレッドに引き渡すための設定
-        // C言語の ctx->stream_handler = handler; に相当
-        let handler = handler;
-
-        // handle をクローンして移動させる
-        let handle_mutex = self.handle.clone(); // DeviceHandleのclone (rusb仕様)
-
         // スレッドを停止させるためのセッター変数
         self.stop_flag.store(false, Ordering::SeqCst);
         let stop_flag_thread = self.stop_flag.clone();
@@ -170,85 +165,57 @@ impl BusOps for UsbBusRusb {
         // stream ep
         let ep = self.stream_ep;
 
-        /*
+        // handle をクローンして移動させる
+        // DeviceHandleのclone (rusb仕様)
+        let handle_arc = self.handle.clone();
+
+        // Producer と Consumer を繋ぐチャネル (容量が 128KB * 100 らしい)
+        let (raw_tx, raw_rx) = crossbeam_channel::bounded::<bytes::Bytes>(100);
+
+        // Consumer スレッド (パースと分配の専任)
         thread::spawn(move || {
-            let mut buf = vec![0u8; 512 * 8]; // バルク転送のバッファ
-
-            // ループ内でロックを適切に取得する
-            while !stop_flag_thread.load(Ordering::Relaxed) {
-                // Bulk In を実行 (タイムアウト付き)
-                let result = {
-                    let handle = handle_mutex.lock().unwrap();
-                    handle.read_bulk(ep, &mut buf, Duration::from_millis(100))
-                };
-
-                match result {
-                    Ok(len) => {
-                        // データが取れたら handler を叩く
-                        handler(&buf[..len]);
-                    }
-                    Err(rusb::Error::Timeout) => continue, // タイムアウトは無視して継続
-                    Err(_) => break,                       // エラー発生時はループを抜ける
-                }
+            // raw_rx にデータが届く限り、ひたすらハンドラを回す
+            while let Ok(data) = raw_rx.recv() {
+                handler(&data);
             }
-            println!("[usb_bus] Stream thread terminated.");
+            println!("[usb_bus] Parser thread terminated.");
         });
-        */
 
+        // Producer スレッド (USB受信の専任)
         let join_handle = thread::spawn(move || {
-            let mut buf = vec![0u8; 512 * 8];
+            let mut buf = vec![0u8; 128 * 1024];
 
             while !stop_flag_thread.load(Ordering::Acquire) {
-                let result = {
-                    let handle = handle_mutex.lock().unwrap();
-                    handle.read_bulk(ep, &mut buf, Duration::from_millis(100))
-                };
+                let result = handle_arc.read_bulk(ep, &mut buf, Duration::from_millis(100));
 
                 match result {
                     Ok(len) => {
-                        handler(&buf[..len]);
-                    }
+                        // メモリコピー (128KBなら数usで終わる軽量処理、らしい)
+                        let data = bytes::Bytes::copy_from_slice(&buf[..len]);
 
+                        // try_send を使い、PC側の処理が遅れても USB の読み取りは止めない
+                        if let Err(_) = raw_tx.try_send(data) {
+                            println!("[usb_bus] Warning: Parser thread is too slow! Internal drop occurred.");
+                        }
+                    }
                     Err(rusb::Error::Timeout) => {
                         continue;
                     }
-
                     Err(e) => {
                         println!("[usb_bus] stream read error: {:?}", e);
                         break;
                     }
                 }
             }
-
             println!("[usb_bus] Stream thread terminated.");
         });
 
         *self.stream_thread.lock().unwrap() = Some(join_handle);
-
         Ok(())
     }
 
     // itedtv_bus.c の 511〜540 と思われる。
     // たぶん、streaming の開始で取った諸々を片付ける処理が入っている、と思われる。
-    /*
-    fn stop_streaming(&self) -> Result<(), BusError> {
-        let mut streaming = self.is_streaming.lock().unwrap();
-        if !*streaming {
-            return Ok(());
-        }
-
-        // スレッドを止めるフラグを立てる
-        self.stop_flag.store(true, Ordering::SeqCst);
-
-        // 2. フラグを下ろして停止を通知
-        *streaming = false;
-
-        println!("[usb_bus] Stopping stream...");
-
-        Ok(())
-    }
-    */
-
     fn stop_streaming(&self) -> Result<(), BusError> {
         let mut streaming = self.is_streaming.lock().unwrap();
 
@@ -289,14 +256,12 @@ impl Drop for UsbBusRusb {
             println!("[usb_bus] Auto-stopping stream in drop()");
         }
 
-        if let Ok(handle) = self.handle.lock() {
-            // 占有していたインターフェースの解放
-            let _ = handle.release_interface(0);
-        }
+        // 占有していたインターフェースの解放
+        let _ = self.handle.release_interface(0);
 
         // 一応、Linux 用に、OSのドライバに制御を戻しておく
-        #[cfg(target_os = "linux")]
-        let _ = handle.attach_kernel_driver(0);
+        //#[cfg(target_os = "linux")]
+        //let _ = handle.attach_kernel_driver(0);
 
         // Arc<Mutex<DeviceHandle>> なので、
         // ここでハンドルがスコープを抜ければ、USBデバイスは自動的にクローズされる、らしい。

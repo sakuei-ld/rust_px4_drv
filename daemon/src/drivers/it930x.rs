@@ -83,6 +83,7 @@ fn calc_checksum(buf: &[u8]) -> u16 {
 }
 
 // debug用
+/*
 fn dump_hex(label: &str, data: &[u8]) {
     // 現在のミリ秒を取得
     let now = std::time::SystemTime::now()
@@ -100,15 +101,13 @@ fn dump_hex(label: &str, data: &[u8]) {
     }
     println!();
 }
+*/
 
 impl<B: BusOps> IT930x<B> {
     // it930x.c 78〜176 の移植 ... おそらく Mutex が要るので、あとで調査する。
     pub fn ctrl_msg(&self, cmd: u16, wdata: &[u8], rdata: &mut [u8]) -> Result<(), CtrlMsgError> {
         // Mutex
         let _lock = self.ctrl_lock.lock().unwrap();
-
-        // debug
-        //println!("[ctrl_msg] enter cmd=0x{:04x}", cmd);
 
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
 
@@ -145,17 +144,11 @@ impl<B: BusOps> IT930x<B> {
         // USB 送信
         self.bus.ctrl_tx(&tx).map_err(CtrlMsgError::Bus)?;
 
-        // debug
-        //println!("[ctrl_msg] tx ok");
-
         // RX packet
         //let rx_len = 1 + 1 + 1 + rdata.len() + 2; // C コード側は、256個固定で、内容チェックして rdate 側へ書き込んでいるが、実際に動くか？
         //let mut rx = vec![0u8; rx_len];
         let mut rx = [0u8; 256];
         let rlen = self.bus.ctrl_rx(&mut rx).map_err(CtrlMsgError::Bus)?;
-
-        // debug
-        //println!("[ctrl_msg] rx ok len={}", rlen);
 
         // debug
         //dump_hex("CTRL_MSG WB", &tx);
@@ -480,7 +473,6 @@ impl<B: BusOps> IT930x<B> {
             let p = &fw_data[i..];
             if p[0] != 0x03 {
                 eprintln!("Invalid firmware block at offset {}", i);
-                //return Err(rusb::Error::Other.into());
                 return Err(CtrlMsgError::Bus(rusb::Error::Other.into()));
             }
 
@@ -512,8 +504,6 @@ impl<B: BusOps> IT930x<B> {
         let fw_version = self.read_firmware_version()?;
         if fw_version == 0 {
             eprintln!("Firmware failed to load (version = 0)");
-            //return Err(rusb::Error::Other.into());
-            //return Err(CtrlMsgError::Bus(rusb::Error::Other.into()));
             return Err(CtrlMsgError::InvalidDeviceState(
                 "Firmware failed to boot (version 0)".to_string(),
             ));
@@ -939,11 +929,6 @@ impl<B: BusOps> IT930x<B> {
                     }
 
                     let buf = [len as u8, bus, req.addr << 1];
-
-                    // debug
-                    //println!("[i2c_read] bus={} addr=0x{:02x} len={}", bus, req.addr, len);
-                    //dump_hex("wb", &buf);
-
                     self.ctrl_msg(IT930X_CMD_I2C_READ, &buf, req.data)?;
                 }
 
@@ -957,13 +942,6 @@ impl<B: BusOps> IT930x<B> {
                     buf.push(bus);
                     buf.push(req.addr << 1);
                     buf.extend_from_slice(req.data);
-
-                    // debug
-                    //println!(
-                    //    "[i2c_write] bus={} addr=0x{:02x} len={}",
-                    //    bus, req.addr, len
-                    //);
-                    //dump_hex("wb", &buf);
 
                     self.ctrl_msg(IT930X_CMD_I2C_WRITE, &buf, &mut [])?;
                 }

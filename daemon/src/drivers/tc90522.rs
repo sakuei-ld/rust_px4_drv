@@ -12,7 +12,7 @@ use thiserror::Error;
 pub enum TunerError {
     #[error("control message error: {0}")]
     CtrlMsg(#[from] CtrlMsgError), // CtrlMsgError をラップ
-    #[error("R850 chip not detected.")]
+    #[error("R710/R850 chip not detected.")]
     ChipNotDetected,
     #[error("Invalid state.")]
     InvalidState,
@@ -31,8 +31,8 @@ pub struct Reg(pub u8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum System {
-    ISDB_S,
-    ISDB_T,
+    IsdbS,
+    IsdbT,
 }
 
 pub struct TC90522<'a, B: BusOps> {
@@ -133,18 +133,6 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // I2C経由のTC90522レジスタの書き込み (排他制御なし)
     fn write_regs_nolock(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
-        // debug
-        /*
-            println!(
-                "[tc90522] write_regs_nolock(): reg = {:02X}, buf = {}",
-                reg,
-                buf.iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        */
-
         if buf.is_empty() || (buf.len() > 254) {
             return Err(CtrlMsgError::InvalidLength);
         }
@@ -186,71 +174,10 @@ impl<'a, B: BusOps> TC90522<'a, B> {
         //println!("[tc90522] call i2c_master_request");
         let _lock = self.lock.lock().unwrap();
 
-        /*
-        // Cの特別扱い分岐の再現
-        if requests.len() == 2
-            && requests[0].req == I2CRequestType::Write
-            && requests[1].req == I2CRequestType::Read
-        {
-            // 1) [0xFE, addr<<1, payload...]
-            let mut b0 = Vec::with_capacity(2 + requests[0].data.len());
-            b0.push(0xFE);
-            b0.push(requests[0].addr << 1);
-            b0.extend_from_slice(requests[0].data);
-
-            // 2) [0xFE, addr<<1|1]
-            let mut b1 = [0xFE, (requests[1].addr << 1) | 0x01];
-
-            // 3本を「1回の呼び出し」で投げる
-            let mut master = [
-                I2CCommRequest {
-                    addr: self.i2c_addr,
-                    data: b0.as_mut_slice(),
-                    req: I2CRequestType::Write,
-                },
-                I2CCommRequest {
-                    addr: self.i2c_addr,
-                    data: &mut b1,
-                    req: I2CRequestType::Write,
-                },
-                I2CCommRequest {
-                    addr: self.i2c_addr,
-                    data: requests[1].data,
-                    req: I2CRequestType::Read,
-                },
-            ];
-
-            return self.it930x.i2c_master_request(self.bus, &mut master);
-        }
-        */
         for req in requests.iter_mut() {
-            /*
-            println!(
-                "[tc90522.req] target_addr=0x{:02X} {:?} len={} first={:02X?}",
-                req.addr,
-                req.req,
-                req.data.len(),
-                &req.data.get(..req.data.len().min(8)).unwrap_or(&[])
-            );
-            */
-
             match req.req {
                 I2CRequestType::Read => {
                     let mut write_buf = [0xFE, (req.addr << 1) | 0x01];
-
-                    // debug
-                    /*
-                    println!(
-                        "[tc90522->it930x] READ-SET bus={} it930x_addr=0x{:02X} data={:02X?}",
-                        self.bus, self.i2c_addr, &write_buf
-                    );
-                    println!(
-                        "[tc90522->it930x] READ-DATA bus={} it930x_addr=0x{:02X} len={}",
-                        self.bus,
-                        self.i2c_addr,
-                        req.data.len()
-                    );
-                    */
 
                     let mut master = [
                         I2CCommRequest {
@@ -278,14 +205,6 @@ impl<'a, B: BusOps> TC90522<'a, B> {
                     buf.push(req.addr << 1);
                     buf.extend_from_slice(req.data);
 
-                    // debug
-                    /*
-                    println!(
-                        "[tc90522->it930x] WRITE bus={} it930x_addr=0x{:02X} data={:02X?}",
-                        self.bus, self.i2c_addr, &buf
-                    );
-                    */
-
                     let mut master = [I2CCommRequest {
                         addr: self.i2c_addr,
                         data: buf.as_mut_slice(),
@@ -305,14 +224,14 @@ impl<'a, B: BusOps> TC90522<'a, B> {
         println!("[tc90522] sleep(): sleep = {}", sleep);
 
         match self.system {
-            System::ISDB_S => {
+            System::IsdbS => {
                 if sleep {
                     self.write_multiple_regs(&[(0x13, &[0x80]), (0x17, &[0xFF])])
                 } else {
                     self.write_multiple_regs(&[(0x13, &[0x00]), (0x17, &[0x00])])
                 }
             }
-            System::ISDB_T => self.write_regs(0x03, if sleep { &[0xF0] } else { &[0x00] }),
+            System::IsdbT => self.write_regs(0x03, if sleep { &[0xF0] } else { &[0x00] }),
         }
     }
 
@@ -325,7 +244,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
         );
 
         match self.system {
-            System::ISDB_S => {
+            System::IsdbS => {
                 let mut r10 = if self.is_secondary { 0x30 } else { 0xB0 };
                 let mut r0a = 0x00;
                 let mut r11 = 0x02;
@@ -343,7 +262,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
                     (0x03, &[0x01]),
                 ])
             }
-            System::ISDB_T => {
+            System::IsdbT => {
                 let r23 = if on { 0x4D & !0x01 } else { 0x4D };
                 self.write_multiple_regs(&[
                     (0x25, &[0x00]),
@@ -361,7 +280,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
         //println!("[tc90522] tmcc_get_tsid(): idx = {}", idx);
 
         match self.system {
-            System::ISDB_S => {
+            System::IsdbS => {
                 if idx >= 12 {
                     return Err(CtrlMsgError::InvalidLength);
                 }
@@ -375,7 +294,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
                 Ok(tsid)
             }
-            System::ISDB_T => {
+            System::IsdbT => {
                 println!("[debug] TC90522 tmcc_get_tsid is not used for ISDB-T.");
                 Ok(0)
             }
@@ -388,13 +307,13 @@ impl<'a, B: BusOps> TC90522<'a, B> {
         //println!("[tc90522] get_tsid() called");
 
         match self.system {
-            System::ISDB_S => {
+            System::IsdbS => {
                 let mut b = [0u8; 2];
                 // 移植元 0xe6 レジスタから読み出し
                 self.read_regs(0xe6, &mut b)?;
                 Ok(u16::from_be_bytes(b))
             }
-            System::ISDB_T => {
+            System::IsdbT => {
                 // 地上波では使用されないため 0 を返す
                 println!("[debug] TC90522 get_tsid is not used for ISDB-T.");
                 Ok(0)
@@ -406,11 +325,11 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     pub fn set_tsid(&self, tsid: u16) -> Result<(), CtrlMsgError> {
         //println!("[tc90522] set_tsid(): tsid = {}", tsid);
         match self.system {
-            System::ISDB_S => {
+            System::IsdbS => {
                 // 移植元 0x8f レジスタへ書き込み
                 self.write_regs(0x8f, &tsid.to_be_bytes())
             }
-            System::ISDB_T => {
+            System::IsdbT => {
                 // 地上波では何もしない
                 println!("[debug] TC90522 set_tsid is not used for ISDB-T.");
                 Ok(())
@@ -422,17 +341,19 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     pub fn get_cn(&self) -> Result<u32, CtrlMsgError> {
         //println!("[tc90522] call get_cn");
         match self.system {
-            System::ISDB_S => {
+            System::IsdbS => {
                 // tc90522_get_cn_s 相当 (16bit)
                 let mut b = [0u8; 2];
                 self.read_regs(0xbc, &mut b)?;
+
                 // tc90522_get_cn_s だと 16bit で返していたが、関数を統一化するため、32bit へ変換
                 Ok(u16::from_be_bytes(b) as u32)
             }
-            System::ISDB_T => {
+            System::IsdbT => {
                 // tc90522_get_cndat_t 相当 (24bit)
                 let mut b = [0u8; 3];
                 self.read_regs(0x8b, &mut b)?;
+
                 // [b0, b1, b2] -> (b0 << 16) | (b1 << 8) | b2
                 // u32にしつつ C のコード通り変換する。
                 Ok(((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32))
@@ -445,7 +366,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
         // debug
         println!("[tc90522] enable_ts_pins(): enable = {}", enable);
         match self.system {
-            System::ISDB_S => {
+            System::IsdbS => {
                 // tc90522_enable_ts_pins_s 相当
                 if enable {
                     self.write_multiple_regs(&[(0x1c, &[0x00]), (0x1f, &[0x00])])
@@ -453,7 +374,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
                     self.write_multiple_regs(&[(0x1c, &[0x80]), (0x1f, &[0x22])])
                 }
             }
-            System::ISDB_T => {
+            System::IsdbT => {
                 // tc90522_enable_ts_pins_t 相当
                 let val = if enable { 0x00 } else { 0xa8 };
                 self.write_regs(0x1d, &[val])
@@ -466,21 +387,15 @@ impl<'a, B: BusOps> TC90522<'a, B> {
         // debug
         println!("[tc90522] call is_signal_locked");
         match self.system {
-            System::ISDB_S => {
+            System::IsdbS => {
                 // tc90522_is_signal_locked_s 相当
                 // レジスタ 0xc3 の 0x10 ビットが 0 ならロック
                 let mut b = [0u8];
                 self.read_regs(0xc3, &mut b)?;
 
-                // ★ここに追加：どんな値が読み出されているか確認する
-                //println!(
-                //    "[debug] TC90522::is_signal_locked System::ISDB_S reg 0xc3 = 0x{:02X}",
-                //    b[0]
-                //);
-
                 Ok((b[0] & 0x10) == 0)
             }
-            System::ISDB_T => {
+            System::IsdbT => {
                 // tc90522_is_signal_locked_t 相当
                 // 0x80 のチェックと 0xb0 のチェックを連続で行う
                 let _lock = self.lock.lock().unwrap();
@@ -498,20 +413,6 @@ impl<'a, B: BusOps> TC90522<'a, B> {
             }
         }
     }
-
-    // debug用
-    /*
-    pub fn dump_regs(&self, start: u8, end: u8) -> Result<(), CtrlMsgError> {
-        for reg in start..=end {
-            let mut buf = [0u8];
-            self.read_regs(reg, &mut buf)?;
-
-            println!("[dump] TC90522 reg[0x{:02X}] = 0x{:02X}", reg, buf[0]);
-        }
-
-        Ok(())
-    }
-    */
 }
 
 // term() の代わり および Rust として、終了時に適切にデバイスを止めるための実装をここで行う。

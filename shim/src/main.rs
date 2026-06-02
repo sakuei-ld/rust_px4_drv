@@ -40,7 +40,6 @@ enum Commands {
 // Daemonからのレスポンス用構造体
 #[derive(Deserialize, Debug)]
 struct SignalResponse {
-    status: String,
     cnr: Option<f64>, // Raw値を直接f64で受け取る
     message: Option<String>,
 }
@@ -292,10 +291,13 @@ fn main() -> Result<()> {
             // --- 出力先の抽象化 ---
             let out_path = output_path.unwrap();
             let mut writer: Box<dyn Write> = if out_path == "-" {
-                Box::new(std::io::stdout())
+                Box::new(BufWriter::with_capacity(128 * 1024, std::io::stdout()))
             } else {
                 eprintln!("Recording to file: {}", out_path);
-                Box::new(BufWriter::new(File::create(&out_path)?))
+                Box::new(BufWriter::with_capacity(
+                    128 * 1024,
+                    File::create(&out_path)?,
+                ))
             };
 
             // Ctrl+C 等の終了要求を検知できるよう、タイムアウトを設定して読み込む
