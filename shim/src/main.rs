@@ -3,12 +3,12 @@ use clap::{Parser, Subcommand};
 use protocol::{ChannelConfig, ChannelSpace, DaemonCommand};
 use serde::Deserialize;
 use std::fs::File;
-use std::io::{stdout, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
 
 // --- CLI引数の定義 (clap を使用) ---
 #[derive(Parser, Debug)]
-#[command(name = "recisdb", about = "px4_drv shim client")]
+#[command(name = "rust_px4_drv_shim", about = "rust_px4_drv shim client")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
