@@ -42,7 +42,14 @@ pub enum DaemonCommand {
     GetSignal { port: usize },
 }
 
-// 構造体を定義（shim側と共通化推奨）
+// ステータスやりとり用
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StatusResponse {
+    pub status: String,
+    pub message: Option<String>,
+}
+
+// Signal 用
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SignalResponse {
     pub status: String,

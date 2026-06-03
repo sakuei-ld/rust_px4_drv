@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use crossbeam_channel::RecvTimeoutError;
 use rusb::{Context, UsbContext};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -13,7 +14,9 @@ use rust_px4_drv_daemon::drivers::it930x::IT930x;
 use rust_px4_drv_daemon::drivers::itedtv_bus::{BusOps, UsbBusRusb};
 use rust_px4_drv_daemon::drivers::px4_device::Px4Device;
 
-use protocol::{ChannelConfig, ChannelSpace, DaemonCommand, LnbMode, SignalResponse};
+use protocol::{
+    ChannelConfig, ChannelSpace, DaemonCommand, LnbMode, SignalResponse, StatusResponse,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Px4DeviceType {
@@ -22,8 +25,52 @@ pub enum Px4DeviceType {
 }
 
 const TIMEOUT_MS: u128 = 5000;
-
 static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub struct ClientIo {
+    reader: BufReader<UnixStream>,
+    writer: BufWriter<UnixStream>,
+}
+
+impl ClientIo {
+    pub fn new(stream: UnixStream) -> std::io::Result<Self> {
+        Ok(Self {
+            reader: BufReader::new(stream.try_clone()?),
+            writer: BufWriter::with_capacity(128 * 1024, stream),
+        })
+    }
+
+    pub fn read_line(&mut self, line: &mut String) -> std::io::Result<usize> {
+        self.reader.read_line(line)
+    }
+
+    pub fn send_json<T: Serialize>(&mut self, value: &T) -> anyhow::Result<()> {
+        serde_json::to_writer(&mut self.writer, value)?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    pub fn send_ts(&mut self, packet: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(packet)?;
+        self.writer.flush()
+    }
+}
+
+// StatusResponse の生成へルパ
+fn send_ok(io: &mut ClientIo) {
+    let _ = io.send_json(&StatusResponse {
+        status: "ok".into(),
+        message: None,
+    });
+}
+
+fn send_error(io: &mut ClientIo, msg: impl Into<String>) {
+    let _ = io.send_json(&StatusResponse {
+        status: "error".into(),
+        message: Some(msg.into()),
+    });
+}
 
 // チャンネルから周波数(kHz)への変換ヘルパー
 fn channel_to_freq_khz(config: &ChannelConfig) -> anyhow::Result<u32> {
@@ -251,10 +298,11 @@ fn handle_client<B: BusOps + Send + Sync>(
     // 読み込みにタイムアウトを設定（0.5秒ごとにフラグを確認しにくる）
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
 
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut line = String::new();
+    //let mut reader = BufReader::new(stream.try_clone().unwrap());
+    //let mut writer = BufWriter::with_capacity(128 * 1024, stream.try_clone().unwrap());
 
-    let mut writer = BufWriter::with_capacity(128 * 1024, stream.try_clone().unwrap());
+    let mut io = ClientIo::new(stream).unwrap();
+    let mut line = String::new();
 
     // クライアントの接続ライフサイクルを管理するガード
     let mut guard = ClientGuard {
@@ -265,7 +313,8 @@ fn handle_client<B: BusOps + Send + Sync>(
     while !SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
         line.clear();
         // クライアントから送られてくる1行（JSON）を待つ
-        match reader.read_line(&mut line) {
+        //match reader.read_line(&mut line) {
+        match io.read_line(&mut line) {
             Ok(0) => {
                 info!("[client] Disconnected.");
                 break;
@@ -298,11 +347,7 @@ fn handle_client<B: BusOps + Send + Sync>(
                                         info!("Attempting open tuner: {}", port);
                                         // 他のクライアントが使用中であれば、ここでエラー(InvalidState)になる
                                         if let Err(e) = dev.open_tuner(port) {
-                                            let _ = writeln!(
-                                                stream,
-                                                "{{\"status\":\"error\",\"message\":\"{:?}\"}}",
-                                                e
-                                            );
+                                            send_error(&mut io, format!("{}", e));
                                             return;
                                         }
 
@@ -327,11 +372,7 @@ fn handle_client<B: BusOps + Send + Sync>(
                                         // 周波数・帯域幅の設定を実行（チューナーLSIへの書き込みとPLLロック）
                                         info!("Attempting to tune to {} kHz", freq_khz);
                                         if let Err(e) = dev.tune(port, freq_khz) {
-                                            let _ = writeln!(
-                                                stream,
-                                                "{{\"status\":\"error\",\"message\":\"{:?}\"}}",
-                                                e
-                                            );
+                                            send_error(&mut io, format!("{}", e));
                                             continue;
                                         }
 
@@ -367,7 +408,7 @@ fn handle_client<B: BusOps + Send + Sync>(
                                             );
 
                                             // ロックに失敗した場合はエラー（または警告）を返す
-                                            let _ = writeln!(stream, "{{\"status\":\"error\",\"message\":\"Tuner did not lock\"}}");
+                                            send_error(&mut io, "Tuner did not lock");
                                             continue;
                                         }
 
@@ -428,7 +469,10 @@ fn handle_client<B: BusOps + Send + Sync>(
                                                 if let Err(e) = dev
                                                     .set_lnb_voltage(port as usize, target_voltage)
                                                 {
-                                                    let _ = writeln!(stream, "{{\"status\":\"error\",\"message\":\"LNB voltage set failed: {:?}\"}}", e);
+                                                    send_error(
+                                                        &mut io,
+                                                        format!("LNB voltage set failed: {}", e),
+                                                    );
                                                     return;
                                                 }
                                             }
@@ -440,20 +484,16 @@ fn handle_client<B: BusOps + Send + Sync>(
 
                                         // SetCapture を true に
                                         if let Err(e) = dev.set_capture(port, true) {
-                                            let _ = writeln!(stream, "{{\"status\":\"error\",\"message\":\"Capture error: {:?}\"}}", e);
+                                            send_error(&mut io, format!("Capture error: {}", e));
                                             continue;
                                         }
 
                                         // 最後まで進めたら OK
-                                        let _ = writeln!(stream, "{{\"status\":\"ok\"}}");
+                                        send_ok(&mut io);
                                     }
                                     Err(e) => {
                                         // 不適切な設定（エラー）だった場合はクライアントに通知
-                                        let _ = writeln!(
-                                            stream,
-                                            "{{\"status\":\"error\",\"message\":\"{}\"}}",
-                                            e
-                                        );
+                                        send_error(&mut io, format!("{:?}", e));
                                     }
                                 }
                             }
@@ -461,18 +501,17 @@ fn handle_client<B: BusOps + Send + Sync>(
                             // SetChannel されてから呼ばれる前提
                             DaemonCommand::StartStream { port } => {
                                 // 成功応答を返し、即座にストリーミング（バイナリ転送）モードに移行
-                                let _ = writeln!(stream, "{{\"status\":\"ok\"}}");
+                                send_ok(&mut io);
 
                                 if let Some(rx) = receivers.get(port) {
                                     loop {
                                         match rx.recv_timeout(std::time::Duration::from_millis(500))
                                         {
                                             Ok(packet) => {
-                                                if writer.write_all(&packet).is_err() {
+                                                if io.send_ts(&packet).is_err() {
                                                     info!("[client] stream closed.");
                                                     break;
                                                 }
-                                                let _ = writer.flush();
                                             }
 
                                             Err(RecvTimeoutError::Timeout) => {
@@ -498,7 +537,7 @@ fn handle_client<B: BusOps + Send + Sync>(
                                 let mut dev = px4_device.lock().unwrap();
                                 let _ = dev.set_capture(port, false);
                                 let _ = dev.close_tuner(port);
-                                let _ = writeln!(stream, "{{\"status\":\"ok\"}}");
+                                send_ok(&mut io);
                             }
 
                             // SetChannel されてから呼ばれる前提
@@ -524,22 +563,15 @@ fn handle_client<B: BusOps + Send + Sync>(
                                     },
                                 };
 
-                                // serde_json で書き込む（自動的にエスケープされる）
-                                if let Err(e) = serde_json::to_writer(&stream, &response) {
-                                    eprintln!("Failed to write JSON response: {}", e);
-                                } else {
-                                    // 最後に改行を送信（shimの read_line 用）
-                                    let _ = stream.write_all(b"\n");
+                                // 送信
+                                if let Err(e) = io.send_json(&response) {
+                                    error!("send_json failed: {}", e);
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = writeln!(
-                            stream,
-                            "{{\"status\":\"error\",\"message\":\"Invalid JSON: {}\"}}",
-                            e
-                        );
+                        send_error(&mut io, format!("Invalid JSON: {}", e));
                     }
                 }
             }
