@@ -1,3 +1,5 @@
+use tracing::{error, info};
+
 use std::sync::Mutex;
 
 use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
@@ -3420,7 +3422,7 @@ impl<'a, B: BusOps> R850<'a, B> {
     // 0〜3 の範囲で水晶発振器のパワー設定を変えながら PLL がロックするかどうかテストし、最適なパワー設定値を探し出す。
     pub fn check_xtal_power(&self, priv_data: &mut R850Priv) -> Result<(), CtrlMsgError> {
         // debug
-        println!("[R850] call check_xtal_power().");
+        info!("call check_xtal_power().");
 
         let bank = 55u8;
         let mut pwr = 3u8; // xtal 24MHz
@@ -3491,7 +3493,7 @@ impl<'a, B: BusOps> R850<'a, B> {
         is_secondary: bool,
     ) -> Result<Self, TunerError> {
         // debug
-        println!("[R850] new()");
+        info!("new()");
 
         let tc90522 = TC90522::new(
             it930x,
@@ -3584,8 +3586,8 @@ impl<'a, B: BusOps> R850<'a, B> {
         }
 
         // debug
-        println!(
-            "[debug] r850.sleep chip={:?} loop_through={} i2c_addr={:02X} r08=0x{:02x}",
+        info!(
+            "sleep(): chip={:?} loop_through={} i2c_addr={:02X} r08=0x{:02x}",
             priv_data.chip, self.config.loop_through, self.i2c_addr, priv_data.regs[0x08]
         );
 
@@ -3704,7 +3706,7 @@ impl<'a, B: BusOps> R850<'a, B> {
         // r850_read_regs(t, 0x02, &tmp, 1) に相当
         if let Err(e) = self.read_regs(0x02, &mut tmp) {
             // Cコードの dev_err() に相当するエラーログ出力
-            eprintln!("r850_is_pll_locked: read_regs() failed. ({:?})", e);
+            error!("r850_is_pll_locked: read_regs() failed. ({:?})", e);
             return Err(TunerError::CtrlMsg(e));
         }
 
@@ -3720,7 +3722,7 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
     // 初期化処理
     fn init(&mut self) -> Result<(), TunerError> {
         // debug
-        println!("[RT710] init()");
+        info!("init()");
 
         // 初期状態の設定
         let mut priv_data = self.priv_.lock().unwrap();
@@ -3781,7 +3783,7 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
         priv_data.init = true;
 
         // いらないのでは？
-        println!(
+        info!(
             "R850 init done. chip: {:?}, reg08=0x{:02x}",
             priv_data.chip, regs[0]
         );
@@ -3793,7 +3795,7 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
     // px4_device.c の一部の機能を切り出し
     fn open(&self) -> Result<(), TunerError> {
         // debug
-        println!("[R850] call open().");
+        info!("call open().");
 
         // 1. 個別ウェイクアップレジスタ (tc_init_t) の書き込み
         self.tc90522.write_multiple_regs(&TC_INIT_T)?;
@@ -3823,7 +3825,7 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
     // px4_device.c の一部の機能を切り出し
     fn close(&self) -> Result<(), TunerError> {
         // debug
-        println!("[R850] call close().");
+        info!("call close().");
 
         let mut priv_data = self.priv_.lock().unwrap();
 
@@ -3837,21 +3839,21 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
         // 3. 復調器をスリープ
         self.tc90522.sleep(true)?;
 
-        println!("[R850] Device closed and put to sleep.");
+        info!("Device closed and put to sleep.");
         Ok(())
     }
 
     fn init_0(&self) -> Result<(), TunerError> {
         // px4_device.c のコードの一部を切り出して、R850の役割として貼り付け
         // 492行目の処理で、Tuner の オープン1個目のときに走らせる。
-        println!("[R850] Performing global demodulator initialization (T0)...");
+        info!("Performing global demodulator initialization (T0)...");
         self.tc90522.write_multiple_regs(&TC_INIT_T0)?;
         Ok(())
     }
 
     fn tune(&mut self, freq: u32) -> Result<(), TunerError> {
         // debug
-        println!("[R850] tune(): freq = {}", freq);
+        info!("tune(): freq = {}", freq);
 
         // px4_device.c のコードの一部を切り出して、R850の役割として貼り付け
         // px4_chrdev_tune_t() の移植
@@ -3905,7 +3907,7 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
 
     /// 明示的な終了処理
     fn term(&mut self) -> Result<(), TunerError> {
-        println!("[info] R850 terminating tuner...");
+        info!("terminating tuner...");
         {
             // Mutexをロックして内部データにアクセスします。
             // 既に他のスレッドでパニックが発生してポイズニングされている可能性を考慮し、
@@ -3973,6 +3975,8 @@ impl<'a, B: BusOps> Drop for R850<'a, B> {
 
             // 5. 初期化フラグを倒す
             priv_data.init = false;
+
+            info!("dropped and terminated.");
         }
     }
 }

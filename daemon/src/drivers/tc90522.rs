@@ -1,5 +1,8 @@
 // TC90522 の制御用
 
+use thiserror::Error;
+use tracing::{info, warn};
+
 use std::sync::Mutex;
 
 // 多分、これで大丈夫だと思う。
@@ -7,7 +10,6 @@ use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930
 use crate::drivers::itedtv_bus::BusOps;
 
 // エラー関連 (RT710 および R850 の TunerError は共通のはずなので、共通でアクセスするこちらに保持)
-use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TunerError {
     #[error("control message error: {0}")]
@@ -64,7 +66,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
         system: System,
         is_secondary: bool,
     ) -> Self {
-        println!("[tc90522.new] bus={} tc90522_addr=0x{:02X}", bus, i2c_addr);
+        info!("new(): bus={} tc90522_addr=0x{:02X}", bus, i2c_addr);
 
         TC90522 {
             it930x,
@@ -78,7 +80,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // 明示的な終了処理 (tc90522_term()相当)
     pub fn term(&mut self) -> Result<(), TunerError> {
-        println!("[info] TC90522 terminating: powering down...");
+        info!("terminating: powering down...");
 
         // デバイスをスリープ状態にする
         self.sleep(true)?;
@@ -88,7 +90,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     // I2C経由のTC90522レジスタの読み込み (排他制御なし)
     fn read_regs_nolock(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
         // debug
-        //println!("[tc90522] read_regs_nolock(): reg={:02X}", reg);
+        //info!("read_regs_nolock(): reg={:02X}", reg);
 
         if buf.is_empty() {
             return Err(CtrlMsgError::InvalidLength);
@@ -114,14 +116,14 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // I2C経由のTC90522レジスタの読み込み
     pub fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
-        //println!("[tc90522] call read_regs");
+        //info!("call read_regs");
         let _lock = self.lock.lock().unwrap();
         self.read_regs_nolock(reg, buf)
     }
 
     // I2C経由のTC90522レジスタの多重読み込み
     pub fn read_multiple_regs(&self, regs: &mut [(u8, &mut [u8])]) -> Result<(), CtrlMsgError> {
-        //println!("[tc90522] call read_multiple_regs");
+        //info!("call read_multiple_regs");
         let _lock = self.lock.lock().unwrap();
 
         for (reg, data) in regs.iter_mut() {
@@ -152,14 +154,14 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     // I2C経由のTC90522レジスタの書き込み
     pub fn write_regs(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
-        //println!("[tc90522] call write_regs");
+        //info!("call write_regs");
         let _lock = self.lock.lock().unwrap();
         self.write_regs_nolock(reg, buf)
     }
 
     // I2C経由のTC90522レジスタの多重書き込み
     pub fn write_multiple_regs(&self, regs: &[(u8, &[u8])]) -> Result<(), CtrlMsgError> {
-        //println!("[tc90522] call write_multiple_regs");
+        //info!("call write_multiple_regs");
         let _lock = self.lock.lock().unwrap();
         for &(reg, data) in regs {
             self.write_regs_nolock(reg, data)?;
@@ -171,7 +173,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     // チューナーチップへのI2Cブリッジ通信
     // TC90522特有のパケット整形を行う。
     pub fn i2c_master_request(&self, requests: &mut [I2CCommRequest]) -> Result<(), CtrlMsgError> {
-        //println!("[tc90522] call i2c_master_request");
+        //info!("call i2c_master_request");
         let _lock = self.lock.lock().unwrap();
 
         for req in requests.iter_mut() {
@@ -221,7 +223,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     // PD操作(各方式(インスタンスが保持するモード)のデジタル回路を低電力状態にする)
     pub fn sleep(&self, sleep: bool) -> Result<(), CtrlMsgError> {
         // debug
-        println!("[tc90522] sleep(): sleep = {}", sleep);
+        info!("sleep(): sleep = {}", sleep);
 
         match self.system {
             System::IsdbS => {
@@ -238,8 +240,8 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     // AGC設定(自動利得制御(信号増幅)の設定)
     pub fn set_agc(&self, on: bool) -> Result<(), CtrlMsgError> {
         // debug
-        println!(
-            "[debug] set_agc(): on = {}, is_secondary = {}",
+        info!(
+            "set_agc(): on = {}, is_secondary = {}",
             on, self.is_secondary
         );
 
@@ -277,7 +279,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     // TMCC(制御信号) から TSID(ストリーム識別子) を取得 (ISDB-S専用)
     pub fn tmcc_get_tsid(&self, idx: u8) -> Result<u16, CtrlMsgError> {
         // debug
-        //println!("[tc90522] tmcc_get_tsid(): idx = {}", idx);
+        //info!("tmcc_get_tsid(): idx = {}", idx);
 
         match self.system {
             System::IsdbS => {
@@ -295,7 +297,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
                 Ok(tsid)
             }
             System::IsdbT => {
-                println!("[debug] TC90522 tmcc_get_tsid is not used for ISDB-T.");
+                warn!("[debug] TC90522 tmcc_get_tsid is not used for ISDB-T.");
                 Ok(0)
             }
         }
@@ -304,7 +306,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     /// TSID (Transport Stream ID) を取得 (ISDB-S専用)
     pub fn get_tsid(&self) -> Result<u16, CtrlMsgError> {
         // debug
-        //println!("[tc90522] get_tsid() called");
+        //info!("get_tsid() called");
 
         match self.system {
             System::IsdbS => {
@@ -315,7 +317,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
             }
             System::IsdbT => {
                 // 地上波では使用されないため 0 を返す
-                println!("[debug] TC90522 get_tsid is not used for ISDB-T.");
+                warn!("[debug] TC90522 get_tsid is not used for ISDB-T.");
                 Ok(0)
             }
         }
@@ -323,7 +325,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     /// TSID (Transport Stream ID) を設定 (ISDB-S専用)
     pub fn set_tsid(&self, tsid: u16) -> Result<(), CtrlMsgError> {
-        //println!("[tc90522] set_tsid(): tsid = {}", tsid);
+        //info!("set_tsid(): tsid = {}", tsid);
         match self.system {
             System::IsdbS => {
                 // 移植元 0x8f レジスタへ書き込み
@@ -331,7 +333,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
             }
             System::IsdbT => {
                 // 地上波では何もしない
-                println!("[debug] TC90522 set_tsid is not used for ISDB-T.");
+                warn!("[debug] TC90522 set_tsid is not used for ISDB-T.");
                 Ok(())
             }
         }
@@ -339,7 +341,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 
     /// C/N比（信号品質）に関連する生データを取得
     pub fn get_cn(&self) -> Result<u32, CtrlMsgError> {
-        //println!("[tc90522] call get_cn");
+        //info!("call get_cn");
         match self.system {
             System::IsdbS => {
                 // tc90522_get_cn_s 相当 (16bit)
@@ -364,7 +366,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     // TSデータ出力ピン(IT930xへのデータ出力物理ピン)の有効/無効化
     pub fn enable_ts_pins(&self, enable: bool) -> Result<(), CtrlMsgError> {
         // debug
-        println!("[tc90522] enable_ts_pins(): enable = {}", enable);
+        info!("enable_ts_pins(): enable = {}", enable);
         match self.system {
             System::IsdbS => {
                 // tc90522_enable_ts_pins_s 相当
@@ -385,7 +387,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
     // signal lock のチェック(ロック状態が、電波を掴めて、デジタル復元が出来ている状態、らしい)
     pub fn is_signal_locked(&self) -> Result<bool, CtrlMsgError> {
         // debug
-        println!("[tc90522] call is_signal_locked");
+        info!("call is_signal_locked");
         match self.system {
             System::IsdbS => {
                 // tc90522_is_signal_locked_s 相当
@@ -422,7 +424,7 @@ impl<'a, B: BusOps> Drop for TC90522<'a, B> {
         // デバイスをスリープ状態にする
         // 保険としての終了処理とし、エラーは無視。
 
-        println!("[info] TC90522 dropping: powering down...");
+        info!("dropping: powering down...");
 
         let _ = self.sleep(true);
         // 最後に LNA (Low Noise Amplifier) などの電源を切る処理があればここに追加

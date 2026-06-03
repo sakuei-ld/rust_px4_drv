@@ -1,5 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use tracing::{error, info, warn};
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -312,7 +313,7 @@ impl Px4StreamContext {
                 match t.tx.try_send(batch) {
                     Ok(_) => {}
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
-                        eprintln!(
+                        error!(
                             "[Warning] Port {} channel full. Dropped batch.",
                             t.port_number
                         );
@@ -337,8 +338,7 @@ impl<T: Tuner> Px4Chrdev<T> {
             Ok(_) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 // ここで警告ログを出すと、バッファサイズ不足かI/O遅延かを可視化できる
-                // あとで、eprintln! にする
-                println!("[Warning] Channel is full, dropping {} bytes", batch.len());
+                warn!("[Warning] Channel is full, dropping {} bytes", batch.len());
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                 // クライアントが切断された場合の処理
@@ -347,7 +347,7 @@ impl<T: Tuner> Px4Chrdev<T> {
     }
 
     pub fn open(&mut self) -> Result<(), TunerError> {
-        println!("[px4] Opening port {}...", self.port_number);
+        info!("Opening port {}...", self.port_number);
 
         // トレイトオブジェクト経由でチューナーを開く
         self.tuner.open()?;
@@ -373,6 +373,9 @@ pub struct Px4Device<'a, B: BusOps + Sync> {
     lnb_power_count: usize,
 
     streaming_count: usize,
+
+    // PX-Q3U4 かつ multi device として使う場合に true をセットする。
+    use_mldev: bool,
 }
 
 impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
@@ -382,9 +385,11 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         discard_null_packets: bool,
     ) -> Result<(Self, Vec<Receiver<Bytes>>), TunerError> {
         // px4_device_init() の処理
+        // itedtv_bus_init() と it930x_init() は事前に走らせる。
 
         // 一応、オリジナルでは、ここで parse_serial_number() を走らせる。
         // 実装してはいるが、ここでは動かしにくい。
+        // 不要なので削除？
 
         // ブリッジ自体の起動
         it930x.raise()?;
@@ -394,9 +399,12 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         let mut buf = [0u8; 1];
         it930x.read_regs(0x4979, &mut buf)?;
         if buf[0] == 0 {
-            println!("[Px4Device::new] EEPROM error.");
+            error!("[Px4Device::new] EEPROM error.");
             return Err(TunerError::InvalidState);
         }
+
+        // オリジナルは、ここで chrdev ごとの ops と options の設定
+        // および、ringbuf とかの設定
 
         it930x.load_firmware("it930x-firmware.bin")?;
         it930x.init_warm()?;
@@ -405,9 +413,12 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         it930x.set_gpio_mode(7, GpioMode::Out, true)?;
         it930x.set_gpio_mode(2, GpioMode::Out, true)?;
 
-        // use_mldev による分岐
         if use_mldev {
-            println!("[Px4Device::new] No implemented.")
+            // ここで、PX-Q3U4 用の処理
+            // px4_mldev_add()
+            // px4_mldev_alloc()
+
+            // failったときは、px4_mldev_remove()
         } else {
             it930x.write_gpio(7, true)?;
             it930x.write_gpio(2, false)?;
@@ -489,6 +500,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             open_count: 0,
             lnb_power_count: 0,
             streaming_count: 0,
+            use_mldev: use_mldev,
         };
 
         Ok((device, receivers))
@@ -496,8 +508,8 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
     // px4_device.c px4_backend_set_power() の移植
     fn backend_set_power(&mut self, state: bool) -> Result<(), CtrlMsgError> {
-        println!(
-            "[px4] backend_set_power: {}",
+        info!(
+            "backend_set_power: {}",
             if state { "true" } else { "false" }
         );
 
@@ -521,8 +533,8 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     // BS/CSアンテナ用のLNB給電設定 ... チューナー外なので、Px4Device で管理。
     pub fn set_lnb_voltage(&mut self, target_idx: usize, voltage: i32) -> Result<(), TunerError> {
         // debug
-        println!(
-            "[Px4Device] set_lnb_voltage(): target = {}, voltage = {}",
+        info!(
+            "set_lnb_voltage(): target = {}, voltage = {}",
             target_idx, voltage
         );
 
@@ -556,7 +568,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             if self.lnb_power_count == 0 {
                 // Cコードの挙動を再現：OFFにする際のエラーはログ出力に留め、状態の更新を優先する
                 if let Err(e) = self.it930x.write_gpio(11, false) {
-                    println!("[warn] Failed to turn off LNB GPIO 11: {:?}", e);
+                    warn!("[warn] Failed to turn off LNB GPIO 11: {:?}", e);
                 }
             }
 
@@ -580,7 +592,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     // ハードウェアの一斉初期化用関数(open_count が 0 のときに、内部から呼ぶ関数)
     // px4_chrdev_open の中で、open_count が 0 のときの処理を抽出
     fn init(&mut self) -> Result<(), TunerError> {
-        println!("[Px4Device] First tuner open requested. Powering on backend hardware...");
+        info!("First tuner open requested. Powering on backend hardware...");
         // 295行目
         self.backend_set_power(true)?;
 
@@ -595,7 +607,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
     pub fn open_tuner(&mut self, target_idx: usize) -> Result<(), TunerError> {
         // debug
-        println!("[Px4Device] open_tuner(): target = {}", target_idx);
+        info!("open_tuner(): target = {}", target_idx);
 
         // インデックスの範囲外アクセスを防ぐチェック
         if target_idx >= self.px4chrdev.len() {
@@ -629,7 +641,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         if self.open_count == 0 {
             // 一旦、0 と 2 が primary として固定のはずなので、強制で。
             // PX-Q3U4 のことを考えると、何か必要かも？
-            println!("Performing global demodulator initialization (S0/T0)...");
+            info!("Performing global demodulator initialization (S0/T0)...");
             self.px4chrdev[0].tuner.init_0()?;
             self.px4chrdev[2].tuner.init_0()?;
         }
@@ -647,7 +659,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             return Err(TunerError::InvalidArgument);
         }
 
-        println!("[Px4Device] Closing channel index: {}", target_idx);
+        info!("Closing channel index: {}", target_idx);
 
         // すでに閉じている場合は何もしない
         if !self.px4chrdev[target_idx].is_opened {
@@ -663,7 +675,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         // IsdbS（BS/CS）の場合は、チューナーを閉じる前にLNB電源を確実に落とす
         if self.px4chrdev[target_idx].system == System::IsdbS {
             if let Err(e) = self.set_lnb_voltage(target_idx, 0) {
-                println!("[error] Failed to stop LNB voltage during close: {:?}", e);
+                error!("[error] Failed to stop LNB voltage during close: {:?}", e);
             }
         }
 
@@ -675,7 +687,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
         // もし最後のチャンネルが閉じられたなら、エコモード（電源OFF）に移行する
         if self.open_count == 0 {
-            println!("All tuners closed. Powering off backend hardware...");
+            info!("All tuners closed. Powering off backend hardware...");
 
             // 全チップの論理的な終了処理（フラグクリア等）
             for chrdev in self.px4chrdev.iter_mut() {
@@ -693,7 +705,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     /// Bon Driver では、lock チェックしてないので、要らないかも？
     pub fn check_lock(&self, target_idx: usize) -> Result<bool, TunerError> {
         // debug
-        println!("[Px4Device] check_lock(): target = {}", target_idx);
+        info!("check_lock(): target = {}", target_idx);
 
         if !self.px4chrdev[target_idx].is_opened {
             return Ok(false);
@@ -707,7 +719,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         if self.streaming_count == 0 {
             // purge
             if let Err(e) = self.it930x.purge_psb(Duration::from_millis(2000)) {
-                println!("[Px4Device] start_capture(): failed it930x.purge_psb()");
+                error!("start_capture(): failed it930x.purge_psb()");
                 // purge 失敗時はピン出力を戻す
                 let _ = self.px4chrdev[target_idx].tuner.enable_ts_pins(false);
                 return Err(e.into());
@@ -733,7 +745,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             }
         }
 
-        println!("[Px4Device] port {} start capture.", target_idx);
+        info!("port {} start capture.", target_idx);
         self.streaming_count += 1;
         Ok(())
     }
@@ -807,10 +819,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
     pub fn tune(&mut self, target_idx: usize, freq: u32) -> Result<(), TunerError> {
         // debug
-        println!(
-            "[Px4Device] tune(): target = {}, freq = {}.",
-            target_idx, freq
-        );
+        info!("tune(): target = {}, freq = {}.", target_idx, freq);
 
         // インデックスの範囲外アクセスを防ぐチェック
         if target_idx >= self.px4chrdev.len() {
@@ -828,8 +837,8 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
     pub fn set_stream_id(&mut self, target_idx: usize, stream_id: u16) -> Result<(), TunerError> {
         // debug
-        println!(
-            "[Px4Device] set_stream_id(): target = {}, stream_id ={}.",
+        info!(
+            "set_stream_id(): target = {}, stream_id ={}.",
             target_idx, stream_id
         );
 
@@ -893,7 +902,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
 impl<'a, B: BusOps + Sync> Drop for Px4Device<'a, B> {
     fn drop(&mut self) {
-        println!("[Px4Device] Dropping device, ensuring power is off...");
+        info!("Dropping device, ensuring power is off...");
         // 電源が入ったままなら強制的に切る
         if self.open_count > 0 {
             let _ = self.backend_set_power(false);

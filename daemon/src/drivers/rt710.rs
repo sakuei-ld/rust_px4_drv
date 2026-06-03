@@ -1,3 +1,5 @@
+use tracing::{info, warn};
+
 use std::sync::Mutex;
 
 use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
@@ -376,7 +378,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
         // 設定が成功したら周波数を記録
         priv_data.freq = freq;
 
-        println!("[RT710] PLL freq={}", freq);
+        info!("PLL freq={}", freq);
 
         Ok(())
     }
@@ -389,7 +391,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
         is_secondary: bool,
     ) -> Result<Self, TunerError> {
         // debug
-        println!("[RT710] new()");
+        info!("new()");
 
         let tc90522 = TC90522::new(
             it930x,
@@ -451,8 +453,8 @@ impl<'a, B: BusOps> RT710<'a, B> {
         }
 
         // debug
-        println!(
-            "[debug] rt710.sleep chip={:?} clock_out={} i2c_addr={:02X} r01=0x{:02x} r03=0x{:02x}",
+        info!(
+            "sleep(): chip={:?} clock_out={} i2c_addr={:02X} r01=0x{:02x} r03=0x{:02x}",
             priv_data.chip, self.config.clock_out, self.i2c_addr, regs[0x01], regs[0x03]
         );
 
@@ -660,8 +662,8 @@ impl<'a, B: BusOps> RT710<'a, B> {
         regs[0x0f] = ((bw_param.coarse << 2) & 0xfc) | (bw_param.fine & 0x03);
         self.write_regs(0x0f, &[regs[0x0f]])?;
 
-        println!(
-            "[RT710] BW coarse={} fine={} reg0f=0x{:02x}",
+        info!(
+            "BW coarse={} fine={} reg0f=0x{:02x}",
             bw_param.coarse, bw_param.fine, regs[0x0f]
         );
 
@@ -686,7 +688,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
     // 現在チューナーに設定されている RF ゲインのインデックス値（0〜18程度）を計算、取得する。
     pub fn get_rf_gain(&self) -> Result<u8, TunerError> {
         // debug
-        println!("[RT710] call get_rf_gain().");
+        info!("call get_rf_gain().");
 
         let priv_data = self.priv_.lock().unwrap();
         if !priv_data.init {
@@ -758,7 +760,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
     // チューナー初期化
     fn init(&mut self) -> Result<(), TunerError> {
         // debug
-        println!("[RT710] init()");
+        info!("init()");
 
         let mut chip_type = RT710ChipType::UNKNOWN;
         let mut tmp = [0u8; 1];
@@ -784,7 +786,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
         }
 
         // いらないのでは？
-        println!(
+        info!(
             "RT710 init done. chip: {:?}, reg03=0x{:02x}",
             chip_type, tmp[0]
         );
@@ -795,7 +797,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
     // px4_device.c の一部の機能を切り出し
     fn open(&self) -> Result<(), TunerError> {
         // debug
-        println!("[RT710] call open().");
+        info!("call open().");
 
         // 1. 個別ウェイクアップレジスタ (tc_init_s) の書き込み
         self.tc90522.write_multiple_regs(&TC_INIT_S)?;
@@ -808,7 +810,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        println!("[RT710] Device opened and awakened successfully.");
+        info!("Device opened and awakened successfully.");
         Ok(())
     }
 
@@ -816,7 +818,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
     // px4_device.c の一部の機能を切り出し
     fn close(&self) -> Result<(), TunerError> {
         // debug
-        println!("[RT710] call close().");
+        info!("call close().");
 
         let priv_data = self.priv_.lock().unwrap();
 
@@ -830,14 +832,14 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
         // 3. 復調器をスリープ
         self.tc90522.sleep(true)?;
 
-        println!("[RT710] Device closed and put to sleep.");
+        info!("Device closed and put to sleep.");
         Ok(())
     }
 
     fn init_0(&self) -> Result<(), TunerError> {
         // px4_device.c のコードの一部を切り出して、RT710の役割として貼り付け
         // 481行目の処理で、Tuner の オープン1個目のときに走らせる。
-        println!("[RT710] Performing global demodulator initialization (S0)...");
+        info!("Performing global demodulator initialization (S0)...");
         self.tc90522.write_multiple_regs(&TC_INIT_S0)?;
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -847,7 +849,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
 
     fn tune(&mut self, freq: u32) -> Result<(), TunerError> {
         // debug
-        println!("[RT710] tune(): freq = {}", freq);
+        info!("tune(): freq = {}", freq);
 
         // px4_device.c のコードの一部を切り出して、RT710の役割として貼り付け
         // px4_chrdev_tune_s() の移植
@@ -875,11 +877,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
 
         // 信号強度の取得（デバッグ用）
         if let Ok(ss) = self.get_rf_signal_strength() {
-            println!(
-                "[RT710] Locked. Strength: {}.{:03} dBm",
-                ss / 1000,
-                -ss % 1000
-            );
+            info!("Locked. Strength: {}.{:03} dBm", ss / 1000, -ss % 1000);
         }
 
         // 4. AGC設定（true）
@@ -890,7 +888,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
 
     fn is_locked(&self) -> Result<bool, TunerError> {
         // debug
-        println!("[RT710] call is_locked().");
+        info!("call is_locked().");
 
         // px4_device.c のコードの一部を切り出して、RT710の役割として貼り付け
         // px4_chrdev_check_lock_s() の移植
@@ -938,8 +936,8 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
         for i in 0..100 {
             if let Ok(current_tsid) = self.tc90522.get_tsid() {
                 if i % 10 == 0 {
-                    println!(
-                        "[debug] TSID retry {}: expected=0x{:04X}, got=0x{:04X}",
+                    warn!(
+                        "RT710 TSID retry {}: expected=0x{:04X}, got=0x{:04X}",
                         i, tsid, current_tsid
                     );
                 }
@@ -962,7 +960,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
                 return Ok(()); // 既に終了済みなら何もしない
             }
 
-            println!("[rt710] terminating tuner...");
+            info!("[rt710] terminating tuner...");
 
             // 1. 自身のハードウェアをスリープ
             let _ = self.sleep(&*priv_data);
@@ -997,7 +995,7 @@ impl<'a, B: BusOps> Drop for RT710<'a, B> {
                 priv_data.init = false;
                 priv_data.freq = 0;
                 let _ = self.sleep(&*priv_data);
-                println!("RT710 dropped and terminated.");
+                info!("RT710 dropped and terminated.");
 
                 // メモ: tc90522 は構造体のメンバなので、この後自動的に tc90522 の drop() が呼ばれる。
             }

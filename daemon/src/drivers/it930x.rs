@@ -1,5 +1,12 @@
 // コントロールメッセージ層
 // IT930xデバイスとやりとりする独自バイナリプロトコルの実装層
+use thiserror::Error;
+use tracing::{error, info};
+
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
+
+use crate::drivers::itedtv_bus::{BusError, BusOps};
 
 // これに関しては、いろんなところで使うので、実際はここじゃない方が良いかもしれない。
 // 下記2つで i2c_comm.h 17 〜 26 の移植
@@ -15,11 +22,7 @@ pub struct I2CCommRequest<'a> {
     pub req: I2CRequestType,
 }
 
-use crate::drivers::itedtv_bus::{BusError, BusOps};
-
 // エラー型
-//
-use thiserror::Error;
 #[derive(Debug, Error)]
 //#[derive(Debug)]
 pub enum CtrlMsgError {
@@ -44,10 +47,6 @@ pub enum CtrlMsgError {
     #[error("file I/O error: {0}")]
     IO(#[from] std::io::Error),
 }
-
-//use std::os::macos::raw::stat;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct PidFilter {
@@ -415,7 +414,7 @@ impl<B: BusOps> IT930x<B> {
     // it930x.c 619〜630 をそのまま移植
     pub fn raise(&self) -> Result<(), CtrlMsgError> {
         // debug
-        println!("[it930x] raise()");
+        info!("raise()");
         let mut last_err = None;
 
         for _ in 0..5 {
@@ -443,12 +442,12 @@ impl<B: BusOps> IT930x<B> {
     // it930x.c 632 〜 752 の移植
     pub fn load_firmware<P: AsRef<Path>>(&self, path: P) -> Result<(), CtrlMsgError> {
         // debug
-        println!("[it930x] load_firmware()");
+        info!("load_firmware()");
 
         // 1. firmware がロード済みか確認
         let fw_version = self.read_firmware_version()?;
         if fw_version != 0 {
-            println!(
+            info!(
                 "Firmware is already loaded. version: {}.{}.{}.{}",
                 (fw_version >> 24) & 0xff,
                 (fw_version >> 16) & 0xff,
@@ -457,8 +456,6 @@ impl<B: BusOps> IT930x<B> {
             );
             return Ok(());
         }
-
-        println!("[debug] passed read_firmware_version()");
 
         // 2. I2Cスピード設定
         self.write_regs(0xf103, &[self.config.i2c_speed])?;
@@ -472,7 +469,7 @@ impl<B: BusOps> IT930x<B> {
         while i < fw_len {
             let p = &fw_data[i..];
             if p[0] != 0x03 {
-                eprintln!("Invalid firmware block at offset {}", i);
+                error!("Invalid firmware block at offset {}", i);
                 return Err(CtrlMsgError::Bus(rusb::Error::Other.into()));
             }
 
@@ -483,7 +480,7 @@ impl<B: BusOps> IT930x<B> {
             }
 
             if len == 0 {
-                eprintln!("No data in firmware block at offset {}", i);
+                error!("No data in firmware block at offset {}", i);
                 len += 4 + m * 3;
                 i += len;
                 continue;
@@ -503,13 +500,13 @@ impl<B: BusOps> IT930x<B> {
         // 6. firmware version 確認
         let fw_version = self.read_firmware_version()?;
         if fw_version == 0 {
-            eprintln!("Firmware failed to load (version = 0)");
+            error!("Firmware failed to load (version = 0)");
             return Err(CtrlMsgError::InvalidDeviceState(
                 "Firmware failed to boot (version 0)".to_string(),
             ));
         }
 
-        println!(
+        info!(
             "Firmware is loaded. version: {}.{}.{}.{}",
             (fw_version >> 24) & 0xff,
             (fw_version >> 16) & 0xff,
@@ -615,7 +612,7 @@ impl<B: BusOps> IT930x<B> {
 
     pub fn init_warm(&self) -> Result<(), CtrlMsgError> {
         // debug
-        println!("[it930x] init_warm()");
+        info!("init_warm()");
 
         self.write_regs(0x4976, &[0])?;
         self.write_regs(0x4bfb, &[0])?;
@@ -659,7 +656,7 @@ impl<B: BusOps> IT930x<B> {
         enable: bool,
     ) -> Result<(), CtrlMsgError> {
         // debug
-        println!("[it930x] set_gpio_mode()");
+        info!("set_gpio_mode()");
 
         const GPIO_EN_REGS: [u32; 16] = [
             0xd8b0, 0xd8b8, 0xd8b4, 0xd8c0, 0xd8bc, 0xd8c8, 0xd8c4, 0xd8d0, 0xd8cc, 0xd8d8, 0xd8d4,
@@ -758,7 +755,7 @@ impl<B: BusOps> IT930x<B> {
 
     pub fn write_gpio(&self, gpio: i32, high: bool) -> Result<(), CtrlMsgError> {
         // debug
-        println!("[it930x] write_gpio()");
+        info!("write_gpio()");
 
         const GPIO_O_REGS: [u32; 16] = [
             0xd8af, 0xd8b7, 0xd8b3, 0xd8bf, 0xd8bb, 0xd8c7, 0xd8c3, 0xd8cf, 0xd8cb, 0xd8d7, 0xd8d3,
@@ -789,7 +786,7 @@ impl<B: BusOps> IT930x<B> {
         filter: Option<&PidFilter>,
     ) -> Result<(), CtrlMsgError> {
         // debug
-        println!("[it930x] set_pid_filter()");
+        info!("set_pid_filter()");
 
         // 各ポートに対応するレジスタ配列
         const REMAP_MODE_REGS: [u32; 5] = [0xda13, 0xda25, 0xda29, 0xda2d, 0xda7f];
@@ -855,7 +852,7 @@ impl<B: BusOps> IT930x<B> {
         // USB接続であるか確認 (BusOpsトレイトでチェック可能にするのがベストです)
         // ここでは便宜上、条件を満たしている前提とします
         // debug
-        println!("[it930x] call purge_psb()");
+        info!("call purge_psb()");
 
         // 1. レジスタ操作によるPSBパージの有効化
         self.write_reg_mask(0xda1d, 0x01, 0x01)?;
@@ -875,7 +872,7 @@ impl<B: BusOps> IT930x<B> {
         // 処理の成功/失敗に関わらずレジスタを戻すのが安全です
         let _ = self.write_reg_mask(0xda1d, 0x00, 0x01);
 
-        println!("[it930x] purge_psb: read_len: {}", read_len);
+        info!("purge_psb: read_len: {}", read_len);
 
         // 5. 判定処理 (Cの if (len == 512) に相当)
         if read_len == 512 {
@@ -890,7 +887,7 @@ impl<B: BusOps> IT930x<B> {
     where
         F: Fn(&[u8]) + Send + Sync + 'static,
     {
-        println!("[it930x] Start streaming via bus.");
+        info!("Start streaming via bus.");
         self.bus
             .start_streaming(Box::new(handler))
             .map_err(CtrlMsgError::Bus)
@@ -901,7 +898,7 @@ impl<B: BusOps> IT930x<B> {
         // BusOps の stop_streaming を呼び出すだけ
         self.bus.stop_streaming().map_err(CtrlMsgError::Bus)?;
 
-        println!("[it930x] Stopped streaming via bus.");
+        info!("Stopped streaming via bus.");
         Ok(())
     }
 }
@@ -966,12 +963,12 @@ impl<B: BusOps> IT930x<B> {
 }
 impl<B: BusOps> Drop for IT930x<B> {
     fn drop(&mut self) {
-        println!("[it930x] Terminating IT930x device...");
+        info!("Terminating IT930x device...");
 
         // ストリーミングを停止させる
         // Cコードの itedtv_bus_stop_streaming 相当
         if let Err(e) = self.bus.stop_streaming() {
-            eprintln!("[it930x] Failed to stop streaming during drop: {:?}", e);
+            error!("Failed to stop streaming during drop: {:?}", e);
         }
     }
 }

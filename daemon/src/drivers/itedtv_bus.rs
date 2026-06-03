@@ -4,6 +4,8 @@
 // → USB実装を差し替えやすくなる、らしい。
 
 use rusb::{Context, DeviceHandle};
+use tracing::{error, info, instrument, warn};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -55,7 +57,8 @@ pub struct UsbBusRusb {
 
     stop_flag: Arc<AtomicBool>,
 
-    stream_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    consumer_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    producer_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl UsbBusRusb {
@@ -96,8 +99,8 @@ impl UsbBusRusb {
             64
         };
 
-        println!(
-            "[usb_bus] USB Version: {:04x}, Max Bulk Size: {}",
+        info!(
+            "USB Version: {:04x}, Max Bulk Size: {}",
             usb_version.0, max_bulk_size
         );
 
@@ -110,7 +113,8 @@ impl UsbBusRusb {
             max_bulk_size,                             //max_bulk_size,
             is_streaming: Mutex::new(false),
             stop_flag: Arc::new(AtomicBool::new(false)),
-            stream_thread: Mutex::new(None),
+            consumer_thread: Mutex::new(None),
+            producer_thread: Mutex::new(None),
         })
     }
 }
@@ -145,6 +149,7 @@ impl BusOps for UsbBusRusb {
 
     // itedtv_bus.c の 411〜509 と思われる。
     // mutex や メモリ確保、とかのように見える。
+    #[instrument(skip(self, handler), fields(ep = self.stream_ep))]
     fn start_streaming(
         &self,
         handler: Box<dyn Fn(&[u8]) + Send + Sync + 'static>,
@@ -156,7 +161,7 @@ impl BusOps for UsbBusRusb {
 
         *streaming = true;
 
-        println!("[usb_bus] Start stream...");
+        info!("Start stream...");
 
         // スレッドを停止させるためのセッター変数
         self.stop_flag.store(false, Ordering::SeqCst);
@@ -173,16 +178,31 @@ impl BusOps for UsbBusRusb {
         let (raw_tx, raw_rx) = crossbeam_channel::bounded::<bytes::Bytes>(100);
 
         // Consumer スレッド (パースと分配の専任)
-        thread::spawn(move || {
+        let consumer_handle = thread::spawn(move || {
+            // ここで span を生成すると、スレッド内の処理が「どのコンテキストか」明確になる
+            let span = tracing::info_span!("usb_consumer_loop");
+            let _enter = span.enter();
+
             // raw_rx にデータが届く限り、ひたすらハンドラを回す
             while let Ok(data) = raw_rx.recv() {
-                handler(&data);
+                // panic をキャッチしてログに出す
+                if let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler(&data);
+                })) {
+                    // パニックしたらスレッドを終了させる
+                    error!("Handler panicked! Thread will terminate.");
+                    break;
+                }
             }
-            println!("[usb_bus] Parser thread terminated.");
+            info!("Parser thread terminated.");
         });
 
         // Producer スレッド (USB受信の専任)
-        let join_handle = thread::spawn(move || {
+        let producer_handle = thread::spawn(move || {
+            // ここで span を生成すると、スレッド内の処理が「どのコンテキストか」明確になる
+            let span = tracing::info_span!("usb_producer_loop");
+            let _enter = span.enter();
+
             let mut buf = vec![0u8; 128 * 1024];
 
             while !stop_flag_thread.load(Ordering::Acquire) {
@@ -195,22 +215,23 @@ impl BusOps for UsbBusRusb {
 
                         // try_send を使い、PC側の処理が遅れても USB の読み取りは止めない
                         if let Err(_) = raw_tx.try_send(data) {
-                            println!("[usb_bus] Warning: Parser thread is too slow! Internal drop occurred.");
+                            warn!("Warning: Parser thread is too slow! Internal drop occurred.");
                         }
                     }
                     Err(rusb::Error::Timeout) => {
                         continue;
                     }
                     Err(e) => {
-                        println!("[usb_bus] stream read error: {:?}", e);
+                        error!("stream read error: {:?}", e);
                         break;
                     }
                 }
             }
-            println!("[usb_bus] Stream thread terminated.");
+            info!("Stream thread terminated.");
         });
 
-        *self.stream_thread.lock().unwrap() = Some(join_handle);
+        *self.consumer_thread.lock().unwrap() = Some(consumer_handle);
+        *self.producer_thread.lock().unwrap() = Some(producer_handle);
         Ok(())
     }
 
@@ -225,15 +246,19 @@ impl BusOps for UsbBusRusb {
 
         self.stop_flag.store(true, Ordering::SeqCst);
 
-        println!("[usb_bus] Waiting stream thread...");
+        info!("Waiting stream thread...");
 
-        if let Some(handle) = self.stream_thread.lock().unwrap().take() {
+        if let Some(handle) = self.producer_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        if let Some(handle) = self.consumer_thread.lock().unwrap().take() {
             let _ = handle.join();
         }
 
         *streaming = false;
 
-        println!("[usb_bus] Stopped stream.");
+        info!("Stopped stream.");
 
         Ok(())
     }
@@ -246,14 +271,14 @@ impl BusOps for UsbBusRusb {
 impl Drop for UsbBusRusb {
     fn drop(&mut self) {
         // デバイスが破棄されるときに自動で呼ばれる (C の itedtv_bus_term に相当)
-        println!("[usb_bus] Terminating bus...");
+        println!("Terminating bus...");
 
         // もしストリーミング中なら止める
         let streaming = self.is_streaming.lock().unwrap();
         if *streaming {
             // ここでデバイスへ停止コマンドを送る等の処理が必要なら呼ぶ
             // 今回はフラグを下ろすだけですが、実機に合わせて拡張可能、らしい
-            println!("[usb_bus] Auto-stopping stream in drop()");
+            println!("Auto-stopping stream in drop()");
         }
 
         // 占有していたインターフェースの解放
