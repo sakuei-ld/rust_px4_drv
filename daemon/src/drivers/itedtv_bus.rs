@@ -271,7 +271,7 @@ impl BusOps for UsbBusRusb {
 impl Drop for UsbBusRusb {
     fn drop(&mut self) {
         // デバイスが破棄されるときに自動で呼ばれる (C の itedtv_bus_term に相当)
-        println!("Terminating bus...");
+        info!("Terminating bus...");
 
         // もしストリーミング中なら止める
         let streaming = self.is_streaming.lock().unwrap();

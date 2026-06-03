@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use protocol::{ChannelConfig, ChannelSpace, DaemonCommand};
-use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
+
+use protocol::{ChannelConfig, ChannelSpace, DaemonCommand, SignalResponse};
 
 // --- CLI引数の定義 (clap を使用) ---
 #[derive(Parser, Debug)]
@@ -35,13 +35,6 @@ enum Commands {
         #[arg(long)]
         lnb_on: bool,
     },
-}
-
-// Daemonからのレスポンス用構造体
-#[derive(Deserialize, Debug)]
-struct SignalResponse {
-    cnr: Option<f64>, // Raw値を直接f64で受け取る
-    message: Option<String>,
 }
 
 // 変換関数
@@ -287,6 +280,13 @@ fn main() -> Result<()> {
 
             serde_json::to_writer(&stream, &start_stream)?;
             stream.write_all(b"\n")?;
+
+            response.clear();
+            reader.read_line(&mut response)?;
+
+            if !response.contains("\"status\":\"ok\"") {
+                anyhow::bail!("StartStream failed");
+            }
 
             // --- 出力先の抽象化 ---
             let out_path = output_path.unwrap();

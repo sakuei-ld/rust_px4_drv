@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use crossbeam_channel::RecvTimeoutError;
 use rusb::{Context, UsbContext};
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -13,7 +13,7 @@ use rust_px4_drv_daemon::drivers::it930x::IT930x;
 use rust_px4_drv_daemon::drivers::itedtv_bus::{BusOps, UsbBusRusb};
 use rust_px4_drv_daemon::drivers::px4_device::Px4Device;
 
-use protocol::{ChannelConfig, ChannelSpace, DaemonCommand, LnbMode};
+use protocol::{ChannelConfig, ChannelSpace, DaemonCommand, LnbMode, SignalResponse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Px4DeviceType {
@@ -178,13 +178,13 @@ fn main() -> anyhow::Result<()> {
     let socket_path = "/tmp/px4-tuner.sock";
 
     ctrlc::set_handler(move || {
-        info!("\n[info] Received shutdown signal. Cleaning up...");
+        info!("Received shutdown signal. Cleaning up...");
 
         // ソケットファイルの削除
         if let Err(e) = std::fs::remove_file(socket_path) {
             error!("[error] Failed to remove socket file: {}", e);
         } else {
-            info!("[info] Socket file removed.");
+            info!("Socket file removed.");
         }
 
         SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst)
@@ -217,6 +217,8 @@ fn main() -> anyhow::Result<()> {
             match listener.accept() {
                 //Ok(stream) => {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+
                     let rx_clone = Arc::clone(&shared_receivers);
                     let dev_clone = Arc::clone(&shared_device);
 
@@ -269,6 +271,7 @@ fn handle_client<B: BusOps + Send + Sync>(
                 break;
             }
             Ok(_) => {
+                debug!("recv raw line = {:?}", line);
                 match serde_json::from_str::<DaemonCommand>(&line) {
                     Ok(cmd) => {
                         match cmd {
@@ -469,6 +472,7 @@ fn handle_client<B: BusOps + Send + Sync>(
                                                     info!("[client] stream closed.");
                                                     break;
                                                 }
+                                                let _ = writer.flush();
                                             }
 
                                             Err(RecvTimeoutError::Timeout) => {
@@ -507,18 +511,25 @@ fn handle_client<B: BusOps + Send + Sync>(
 
                                 let mut dev = px4_device.lock().unwrap();
                                 // ドライバから現在の C/N 比 (dB値) 等を取得してクライアントに返す
-                                match dev.get_cnr(port) {
-                                    Ok(cnr_raw) => {
-                                        // 必要であればここで raw 値を dB に計算し直すか、そのまま返す
-                                        let _ = writeln!(
-                                            stream,
-                                            "{{\"status\":\"ok\",\"cnr\":{}}}",
-                                            cnr_raw
-                                        );
-                                    }
-                                    Err(e) => {
-                                        let _ = writeln!(stream, "{{\"status\":\"error\",\"message\":\"Failed to read CNR: {:?}\"}}", e);
-                                    }
+                                let response = match dev.get_cnr(port) {
+                                    Ok(cnr_raw) => SignalResponse {
+                                        status: "ok".to_string(),
+                                        cnr: Some(cnr_raw as f64),
+                                        message: None,
+                                    },
+                                    Err(e) => SignalResponse {
+                                        status: "error".to_string(),
+                                        cnr: None,
+                                        message: Some(format!("{:?}", e)),
+                                    },
+                                };
+
+                                // serde_json で書き込む（自動的にエスケープされる）
+                                if let Err(e) = serde_json::to_writer(&stream, &response) {
+                                    eprintln!("Failed to write JSON response: {}", e);
+                                } else {
+                                    // 最後に改行を送信（shimの read_line 用）
+                                    let _ = stream.write_all(b"\n");
                                 }
                             }
                         }
@@ -562,10 +573,7 @@ impl<'a, B: BusOps + Send + Sync> Drop for ClientGuard<'a, B> {
                 let _ = dev.set_capture(port, false);
                 let _ = dev.close_tuner(port);
 
-                info!(
-                    "[info] ClientGuard: Cleaned up port {} on disconnect.",
-                    port
-                );
+                info!("ClientGuard: Cleaned up port {} on disconnect.", port);
             }
         }
     }

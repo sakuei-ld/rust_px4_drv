@@ -41,3 +41,11 @@ pub enum DaemonCommand {
     /// シグナル強度（C/N比）の取得
     GetSignal { port: usize },
 }
+
+// 構造体を定義（shim側と共通化推奨）
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SignalResponse {
+    pub status: String,
+    pub cnr: Option<f64>,
+    pub message: Option<String>,
+}
