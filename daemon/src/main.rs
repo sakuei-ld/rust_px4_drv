@@ -1,12 +1,17 @@
 use bytes::Bytes;
+use clap::Parser;
 use crossbeam_channel::RecvTimeoutError;
 use rusb::{Context, UsbContext};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use time::UtcOffset;
 use tracing::{debug, error, info, instrument, warn};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{
+    fmt, fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+};
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+//use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 // 既存のドライバをインポート
@@ -28,15 +33,21 @@ const TIMEOUT_MS: u128 = 5000;
 static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct ClientIo {
-    reader: BufReader<UnixStream>,
-    writer: BufWriter<UnixStream>,
+    reader: BufReader<TcpStream>,
+    writer: BufWriter<TcpStream>,
+
+    // debug
+    socket_sent_bytes: u64,
+    socket_write_calls: u64,
 }
 
 impl ClientIo {
-    pub fn new(stream: UnixStream) -> std::io::Result<Self> {
+    pub fn new(stream: TcpStream) -> std::io::Result<Self> {
         Ok(Self {
             reader: BufReader::new(stream.try_clone()?),
             writer: BufWriter::with_capacity(128 * 1024, stream),
+            socket_sent_bytes: 0,
+            socket_write_calls: 0,
         })
     }
 
@@ -52,8 +63,12 @@ impl ClientIo {
     }
 
     pub fn send_ts(&mut self, packet: &[u8]) -> std::io::Result<()> {
+        // debug
         self.writer.write_all(packet)?;
-        self.writer.flush()
+        //self.writer.flush()
+        self.socket_sent_bytes += packet.len() as u64;
+        self.socket_write_calls += 1;
+        Ok(())
     }
 }
 
@@ -70,6 +85,18 @@ fn send_error(io: &mut ClientIo, msg: impl Into<String>) {
         status: "error".into(),
         message: Some(msg.into()),
     });
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "rust_px4_drv_daemon", about = "rust_px4_drv daemon")]
+struct Cli {
+    /// 待ち受けるIPアドレス（コンテナ外からアクセスする場合は 0.0.0.0 を指定）
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// 待ち受けるポート番号
+    #[arg(short, long, default_value_t = 40771)]
+    port: u16,
 }
 
 // チャンネルから周波数(kHz)への変換ヘルパー
@@ -117,7 +144,7 @@ fn channel_to_freq_khz(config: &ChannelConfig) -> anyhow::Result<u32> {
             // BS: 1〜23ch (奇数のみ)
             if (1..=23).contains(&config.channel) && config.channel % 2 != 0 {
                 let ch_idx = config.channel / 2;
-                // 💡 衛星波では sub_channel (slot) は周波数計算には使用しない (Cコードと等価)
+                // 衛星波では sub_channel (slot) は周波数計算には使用しない (Cコードと等価)
                 Ok(1049480 + (38360 * ch_idx))
             } else {
                 anyhow::bail!(
@@ -130,7 +157,7 @@ fn channel_to_freq_khz(config: &ChannelConfig) -> anyhow::Result<u32> {
             // CS: 2〜24ch (偶数のみ)
             if (2..=24).contains(&config.channel) && config.channel % 2 == 0 {
                 let ch_idx = config.channel / 2 - 1;
-                // 💡 衛星波では sub_channel (slot) は周波数計算には使用しない (Cコードと等価)
+                // 衛星波では sub_channel (slot) は周波数計算には使用しない (Cコードと等価)
                 Ok(1613000 + (40000 * ch_idx))
             } else {
                 anyhow::bail!(
@@ -145,10 +172,20 @@ fn channel_to_freq_khz(config: &ChannelConfig) -> anyhow::Result<u32> {
 #[instrument(err)]
 fn main() -> anyhow::Result<()> {
     // RUST_LOG 環境変数でレベルを制御可能にする (例: RUST_LOG=info ./daemon)
+    // log の表示時刻の設定
+    let timer = OffsetTime::new(
+        UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC),
+        time::format_description::well_known::Rfc3339,
+    );
+
+    // with_writer(std::io::stderr) が一般的らしい
     tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stdout))
+        .with(fmt::layer().with_writer(std::io::stdout).with_timer(timer))
         .with(EnvFilter::from_default_env())
         .init();
+
+    // 引数のパース
+    let cli = Cli::parse();
 
     // まず、USB関連の準備
     let context = match Context::new() {
@@ -207,7 +244,7 @@ fn main() -> anyhow::Result<()> {
 
     let it930x = IT930x::new(bus);
 
-    // 1. デバイスの初期化と共有管理
+    // デバイスの初期化と共有管理
     // use_mldev は PX_Q3U4 かつ daemon実行時引数でdisable_multi_device_power_controlが立っていない ときに true とかにするのが良い
     let (device, receivers) =
         match Px4Device::new(&it930x, device_type == Px4DeviceType::PX_Q3U4, false) {
@@ -218,38 +255,46 @@ fn main() -> anyhow::Result<()> {
         };
 
     let shared_receivers = Arc::new(receivers);
-    // これがダメっぽい？
     let shared_device = Arc::new(Mutex::new(device));
 
-    // 2. Unix Domain Socket の準備 (シグナルハンドラ準備も含む)
-    let socket_path = "/tmp/px4-tuner.sock";
+    // Unix Domain Socket の準備 (シグナルハンドラ準備も含む)
+    //let socket_path = "/tmp/px4-tuner.sock";
 
+    // TCP ソケットの準備
+    let bind_addr = format!("{}:{}", cli.host, cli.port);
+
+    // シグナルハンドラ(Ctrl+Cキャッチ)の準備
     ctrlc::set_handler(move || {
         info!("Received shutdown signal. Cleaning up...");
 
         // ソケットファイルの削除
-        if let Err(e) = std::fs::remove_file(socket_path) {
-            error!("[error] Failed to remove socket file: {}", e);
-        } else {
-            info!("Socket file removed.");
-        }
+        //if let Err(e) = std::fs::remove_file(socket_path) {
+        //    error!("[error] Failed to remove socket file: {}", e);
+        //} else {
+        //    info!("Socket file removed.");
+        //}
 
         SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst)
     })
     .expect("Error setting Ctrl-C handler");
 
-    if std::path::Path::new(socket_path).exists() {
-        if let Err(e) = std::fs::remove_file(socket_path) {
-            error!("Failed to remove socket file: {}", e);
-        }
-    }
+    //if std::path::Path::new(socket_path).exists() {
+    //    if let Err(e) = std::fs::remove_file(socket_path) {
+    //        error!("Failed to remove socket file: {}", e);
+    //    }
+    //}
 
-    let listener = UnixListener::bind(socket_path)?;
+    //let listener = UnixListener::bind(socket_path)?;
+    //listener.set_nonblocking(true)?;
+
+    let listener = TcpListener::bind(&bind_addr)?;
     listener.set_nonblocking(true)?;
 
     info!(
+        //"[server] Daemon started. Waiting for connections on {}...",
+        //socket_path
         "[server] Daemon started. Waiting for connections on {}...",
-        socket_path
+        bind_addr
     );
 
     // 3. クライアント接続待ちループ
@@ -289,7 +334,8 @@ fn main() -> anyhow::Result<()> {
 
 // クライアントからの要求処理(受信メインループ)
 fn handle_client<B: BusOps + Send + Sync>(
-    mut stream: UnixStream,
+    //stream: UnixStream,
+    stream: TcpStream,
     receivers: Arc<Vec<crossbeam_channel::Receiver<Bytes>>>,
     px4_device: Arc<Mutex<Px4Device<B>>>, // ドライバの共有参照
 ) {
@@ -309,6 +355,9 @@ fn handle_client<B: BusOps + Send + Sync>(
         device: Arc::clone(&px4_device),
         port: None,
     };
+
+    // debug
+    let mut sent_packets = 0u64;
 
     while !SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
         line.clear();
@@ -336,10 +385,18 @@ fn handle_client<B: BusOps + Send + Sync>(
                                         // Px4Device 側に、多重 streaming 排除がついたので、それに合わせて新機能として足してみる
                                         // ポートの確保 (デバイスファイルの open() の相当)
                                         // 現在のクライアントが確保しているポートと違う場合のみオープン処理
-                                        if guard.port != Some(port) {
-                                            // もし、既に別のポートを開いていたなら、それを閉じて返却する
-                                            if let Some(old_port) = guard.port {
-                                                let _ = dev.set_capture(old_port, false);
+                                        //if guard.port != Some(port) {
+                                        // もし、既に別のポートを開いていたなら、それを閉じて返却する
+                                        //    if let Some(old_port) = guard.port {
+                                        //       let _ = dev.set_capture(old_port, false);
+                                        //        let _ = dev.close_tuner(old_port);
+                                        //    }
+                                        //}
+                                        // 同一ポートでも別ポートでも、現在のキャプチャを確実に一度止める
+                                        if let Some(old_port) = guard.port {
+                                            let _ = dev.set_capture(old_port, false);
+                                            // 別ポートへの切り替えの場合は、古いポートをクローズする
+                                            if old_port != port {
                                                 let _ = dev.close_tuner(old_port);
                                             }
                                         }
@@ -509,20 +566,42 @@ fn handle_client<B: BusOps + Send + Sync>(
                                         {
                                             Ok(packet) => {
                                                 if io.send_ts(&packet).is_err() {
+                                                    let _ = io.writer.flush();
                                                     info!("[client] stream closed.");
                                                     break;
+                                                }
+
+                                                // debug
+                                                sent_packets += 1;
+                                                if sent_packets % 1000 == 0 {
+                                                    info!(
+                                                        "stream sent_packets = {} queue_len = {}",
+                                                        sent_packets,
+                                                        rx.len()
+                                                    );
                                                 }
                                             }
 
                                             Err(RecvTimeoutError::Timeout) => {
+                                                // データが途切れたタイミング（0.5秒）でソケットへ確実に押し出す
+                                                if let Err(e) = io.writer.flush() {
+                                                    error!("Flush error: {}", e);
+                                                    break;
+                                                }
                                                 continue;
                                             }
 
                                             Err(RecvTimeoutError::Disconnected) => {
+                                                let _ = io.writer.flush();
                                                 break;
                                             }
                                         }
                                     }
+                                    // debug
+                                    info!(
+                                        "socket sent {} bytes, {} writes",
+                                        io.socket_sent_bytes, io.socket_write_calls
+                                    );
                                 }
 
                                 break;
@@ -575,7 +654,7 @@ fn handle_client<B: BusOps + Send + Sync>(
                     }
                 }
             }
-            // ★タイムアウト/WouldBlockは「データが来ていない」だけなので、
+            // タイムアウト/WouldBlockは「データが来ていない」だけなので、
             // ループを継続して SHUTDOWN フラグを確認させる
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -584,7 +663,7 @@ fn handle_client<B: BusOps + Send + Sync>(
                 continue;
             }
             Err(e) => {
-                error!("[error] Read error: {}", e);
+                error!("Read error: {}", e);
                 break;
             }
         }

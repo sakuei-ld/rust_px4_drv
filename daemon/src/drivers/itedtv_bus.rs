@@ -175,7 +175,22 @@ impl BusOps for UsbBusRusb {
         let handle_arc = self.handle.clone();
 
         // Producer と Consumer を繋ぐチャネル (容量が 128KB * 100 らしい)
-        let (raw_tx, raw_rx) = crossbeam_channel::bounded::<bytes::Bytes>(100);
+        let (raw_tx, raw_rx) = crossbeam_channel::bounded::<bytes::Bytes>(250); // ちょっと増やしてみた
+
+        // debug
+        let packet_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let byte_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let packet_count_consumer = packet_count.clone();
+        let byte_count_consumer = byte_count.clone();
+        let total_packet_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let total_byte_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let total_packet_count_consumer = total_packet_count.clone();
+        let total_byte_count_consumer = total_byte_count.clone();
+
+        // drop数を共有するためのアトミックカウンタ
+        let internal_drop_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let internal_drop_consumer = internal_drop_counter.clone();
+        let internal_drop_producer = internal_drop_counter.clone();
 
         // Consumer スレッド (パースと分配の専任)
         let consumer_handle = thread::spawn(move || {
@@ -183,8 +198,41 @@ impl BusOps for UsbBusRusb {
             let span = tracing::info_span!("usb_consumer_loop");
             let _enter = span.enter();
 
+            // debug
+            let mut last_log = std::time::Instant::now();
+
             // raw_rx にデータが届く限り、ひたすらハンドラを回す
             while let Ok(data) = raw_rx.recv() {
+                // debug
+                packet_count_consumer.fetch_add(1, Ordering::Relaxed);
+                byte_count_consumer.fetch_add(data.len() as u64, Ordering::Relaxed);
+                total_packet_count_consumer.fetch_add(1, Ordering::Relaxed);
+                total_byte_count_consumer.fetch_add(data.len() as u64, Ordering::Relaxed);
+
+                if last_log.elapsed() >= Duration::from_secs(5) {
+                    let packets = packet_count_consumer.swap(0, Ordering::Relaxed);
+                    let bytes = byte_count_consumer.swap(0, Ordering::Relaxed);
+                    let drops = internal_drop_consumer.swap(0, Ordering::Relaxed);
+
+                    info!(
+                        "consumer rate: packets={} bytes={} ({:.2} MiB/s)",
+                        packets,
+                        bytes,
+                        bytes as f64 / 1024.0 / 1024.0 / 5.0
+                    );
+
+                    if drops > 0 {
+                        warn!(
+                            "{} USB packets dropped in the last 5 secs (parser thread too slow.)",
+                            drops
+                        );
+                    }
+
+                    info!("remain packet: {}", raw_rx.len());
+
+                    last_log = std::time::Instant::now();
+                }
+
                 // panic をキャッチしてログに出す
                 if let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handler(&data);
@@ -194,6 +242,11 @@ impl BusOps for UsbBusRusb {
                     break;
                 }
             }
+            info!(
+                "consumer total packets={} bytes={}",
+                total_packet_count_consumer.load(Ordering::Relaxed),
+                total_byte_count_consumer.load(Ordering::Relaxed)
+            );
             info!("Parser thread terminated.");
         });
 
@@ -203,7 +256,11 @@ impl BusOps for UsbBusRusb {
             let span = tracing::info_span!("usb_producer_loop");
             let _enter = span.enter();
 
-            let mut buf = vec![0u8; 128 * 1024];
+            let mut buf = vec![0u8; 1024 * 1024];
+
+            // debug
+            let mut usb_bytes = 0u64;
+            let mut internal_drop = 0u64;
 
             while !stop_flag_thread.load(Ordering::Acquire) {
                 let result = handle_arc.read_bulk(ep, &mut buf, Duration::from_millis(100));
@@ -215,8 +272,14 @@ impl BusOps for UsbBusRusb {
 
                         // try_send を使い、PC側の処理が遅れても USB の読み取りは止めない
                         if let Err(_) = raw_tx.try_send(data) {
-                            warn!("Warning: Parser thread is too slow! Internal drop occurred.");
+                            //debug
+                            internal_drop_producer.fetch_add(1, Ordering::Relaxed);
+                            internal_drop += 1;
+                            //warn!("Warning: Parser thread is too slow! Internal drop occurred.");
                         }
+
+                        // debug
+                        usb_bytes += len as u64;
                     }
                     Err(rusb::Error::Timeout) => {
                         continue;
@@ -228,6 +291,9 @@ impl BusOps for UsbBusRusb {
                 }
             }
             info!("Stream thread terminated.");
+            // debug
+            info!("USB received {} bytes", usb_bytes);
+            info!("internal_drop={}", internal_drop);
         });
 
         *self.consumer_thread.lock().unwrap() = Some(consumer_handle);

@@ -1,8 +1,17 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use signal_hook::consts::{SIGINT, SIGPIPE, SIGTERM};
+use signal_hook::flag;
+
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::os::unix::net::UnixStream;
+//use std::os::unix::net::UnixStream;
+use std::net::TcpStream;
 
 use protocol::{ChannelConfig, ChannelSpace, DaemonCommand, SignalResponse};
 
@@ -12,6 +21,14 @@ use protocol::{ChannelConfig, ChannelSpace, DaemonCommand, SignalResponse};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// 接続先のデーモンのIPアドレス
+    #[arg(long, global = true, default_value = "127.0.0.1")]
+    host: String,
+
+    /// 接続先のデーモンのポート番号
+    #[arg(short, long = "port", global = true, default_value_t = 40771)]
+    tcp_port: u16,
 }
 
 #[derive(Subcommand, Debug)]
@@ -156,14 +173,24 @@ fn main() -> Result<()> {
         _ => None, // 地デジ(GR)の場合はNone
     };
 
+    let term = Arc::new(AtomicBool::new(false));
+    flag::register(SIGINT, term.clone())?;
+    flag::register(SIGTERM, term.clone())?;
+    flag::register(SIGPIPE, term.clone())?;
+
     // Daemon のソケットに接続
-    let socket_path = "/tmp/px4-tuner.sock";
-    println!("Connecting to daemon socket at {}...", socket_path);
+    //let socket_path = "/tmp/px4-tuner.sock";
+    //eprintln!("Connecting to daemon socket at {}...", socket_path);
+
+    // Daemon Server に接続
+    let bind_addr = format!("{}:{}", cli.host, cli.tcp_port);
+    eprintln!("Connecting to daemon at {}...", bind_addr);
 
     let mut stream = loop {
-        match UnixStream::connect(socket_path) {
+        //match UnixStream::connect(socket_path) {
+        match TcpStream::connect(&bind_addr) {
             Ok(s) => {
-                println!("Connected to daemon!");
+                eprintln!("Connected to daemon!");
                 break s;
             }
             Err(e) => {
@@ -199,10 +226,10 @@ fn main() -> Result<()> {
     let mut response = String::new();
     match reader.read_line(&mut response) {
         Ok(n) => {
-            println!("read_line ok n={} response={:?}", n, response);
+            eprintln!("read_line ok n={} response={:?}", n, response);
         }
         Err(e) => {
-            println!(
+            eprintln!(
                 "read_line err kind={:?} raw={:?}",
                 e.kind(),
                 e.raw_os_error()
@@ -216,17 +243,22 @@ fn main() -> Result<()> {
         anyhow::bail!("SetChannel failed: {}", response);
     }
 
-    stream.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+    //stream.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
-    reader
-        .get_mut()
-        .set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+    //reader
+    //    .get_mut()
+    //    .set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
     // モード分岐
     match mode {
         "signal" => {
-            println!("Starting signal monitor (Ctrl+C to stop)...");
-            loop {
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+            reader
+                .get_mut()
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+
+            eprintln!("Starting signal monitor (Ctrl+C to stop)...");
+            while !term.load(Ordering::Acquire) {
                 let get_signal = DaemonCommand::GetSignal {
                     port: port as usize,
                 };
@@ -245,7 +277,7 @@ fn main() -> Result<()> {
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        println!("signal timeout");
+                        eprintln!("signal timeout");
                         continue;
                     }
                     Err(e) => {
@@ -258,9 +290,9 @@ fn main() -> Result<()> {
                 if let Ok(res) = serde_json::from_str::<SignalResponse>(&response) {
                     if let Some(raw_cnr) = res.cnr {
                         let db = calculate_db(raw_cnr as u64, &space);
-                        println!("CNR: {:.2} dB (Raw: {})", db, raw_cnr);
+                        eprintln!("CNR: {:.2} dB (Raw: {})", db, raw_cnr);
                     } else {
-                        println!(
+                        eprintln!(
                             "Error: {}",
                             res.message.unwrap_or_else(|| "Unknown".to_string())
                         );
@@ -270,7 +302,7 @@ fn main() -> Result<()> {
                 // 1秒待機
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            println!("\nStopped.");
+            eprintln!("\nStopped.");
         }
         "tune" => {
             // StartStream コマンドを送信
@@ -287,6 +319,11 @@ fn main() -> Result<()> {
             if !response.contains("\"status\":\"ok\"") {
                 anyhow::bail!("StartStream failed");
             }
+
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+            reader
+                .get_mut()
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
             // --- 出力先の抽象化 ---
             let out_path = output_path.unwrap();
@@ -306,9 +343,12 @@ fn main() -> Result<()> {
 
             let mut buf = [0u8; 8192]; // 8KB 程度のバッファ
 
+            // debug
+            let mut file_bytes = 0u64;
+
             // ソケットから届く TS パケットを標準出力へコピーし続ける
             // running フラグを監視しながらループ
-            loop {
+            while !term.load(Ordering::Acquire) {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF (Daemonが切断された)
                     Ok(n) => {
@@ -317,6 +357,8 @@ fn main() -> Result<()> {
                             // mirakc側がパイプを閉じたら書き込みエラーになるので、それを検知して終了
                             break;
                         }
+                        // debug
+                        file_bytes += n as u64;
                     }
                     // タイムアウト時は何もせず、ループの先頭に戻ってフラグを再確認する
                     Err(ref e)
@@ -334,6 +376,9 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            // 残りを書き出す
+            writer.flush()?;
+            eprintln!("file bytes={}", file_bytes)
         }
         _ => {
             anyhow::bail!("Invalid mode: {}", mode);

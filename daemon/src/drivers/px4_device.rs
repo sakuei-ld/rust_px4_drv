@@ -221,13 +221,23 @@ struct TargetPort {
     tx: Sender<Bytes>,
     // ポートごとの一括送信用バッファ
     buffer: BytesMut,
+    // debug
+    sent_batches: u64,
+    sent_bytes: u64,
 }
+
+// debug
+static DISPATCH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // ストリーム処理部分
 struct Px4StreamContext {
     pub targets: Vec<TargetPort>,
     // バッチ送信用のアロケーション使い回しバッファ
     pub stream_buffer: BytesMut,
+    // debug
+    dispatch_bytes: u64,
+    dispatch_batches: u64,
+    debug_last_log: std::time::Instant,
 }
 
 impl Px4StreamContext {
@@ -238,6 +248,8 @@ impl Px4StreamContext {
                 port_number: c.port_number,
                 tx: c.tx.clone(),
                 buffer: BytesMut::with_capacity(32 * 1024),
+                sent_batches: 0, // debug
+                sent_bytes: 0,
             })
             .collect();
 
@@ -245,6 +257,9 @@ impl Px4StreamContext {
             targets,
             // 64KB分を事前に確保。以降、キャパシティを超えない限りアロケーションは発生しない
             stream_buffer: BytesMut::with_capacity(64 * 1024),
+            dispatch_bytes: 0,
+            dispatch_batches: 0,
+            debug_last_log: std::time::Instant::now(),
         }
     }
 
@@ -271,6 +286,15 @@ impl Px4StreamContext {
 
             if !is_synced {
                 offset += 1;
+
+                // 試行中
+                // 同期が崩れた場合の高速スキャン
+                while offset + PX4_DEVICE_TS_SYNC_SIZE <= self.stream_buffer.len() {
+                    if (self.stream_buffer[offset] & 0x8f) == 0x07 {
+                        break;
+                    }
+                    offset += 1;
+                }
                 continue;
             }
 
@@ -308,20 +332,38 @@ impl Px4StreamContext {
                 // split().freeze() によるゼロコピー送信
                 // t.buffer の中身を切り出し、データのコピーを一切行わずに送信用のイミュータブルな Bytes に変換
                 let batch = t.buffer.split().freeze();
+                let batch_len = batch.len();
 
                 // try_send() で、受信側が詰まっていても USB受信スレッドをブロックさせない
                 match t.tx.try_send(batch) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // debug
+                        t.sent_batches += 1;
+                        t.sent_bytes += batch_len as u64;
+                        self.dispatch_batches += 1;
+                        self.dispatch_bytes += batch_len as u64;
+                    }
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
                         error!(
                             "[Warning] Port {} channel full. Dropped batch.",
                             t.port_number
                         );
                     }
-                    // クライアント切断時など
-                    Err(_) => {}
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        error!("Port {} receiver disconnected", t.port_number);
+                    }
                 }
+
+                DISPATCH_BYTES.fetch_add(batch_len as u64, std::sync::atomic::Ordering::Relaxed);
             }
+        }
+
+        if self.debug_last_log.elapsed() >= Duration::from_secs(5) {
+            info!(
+                "dispatch batches={} bytes={}",
+                self.dispatch_batches, self.dispatch_bytes
+            );
+            self.debug_last_log = std::time::Instant::now();
         }
     }
 }
@@ -836,7 +878,6 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     pub fn set_stream_id(&mut self, target_idx: usize, stream_id: u16) -> Result<(), TunerError> {
-        // debug
         info!(
             "set_stream_id(): target = {}, stream_id ={}.",
             target_idx, stream_id
@@ -907,5 +948,11 @@ impl<'a, B: BusOps + Sync> Drop for Px4Device<'a, B> {
         if self.open_count > 0 {
             let _ = self.backend_set_power(false);
         }
+
+        // debug
+        info!(
+            "dispatch bytes={}",
+            DISPATCH_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 }
