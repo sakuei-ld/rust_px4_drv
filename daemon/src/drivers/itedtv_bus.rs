@@ -71,8 +71,38 @@ impl UsbBusRusb {
         //    }
         //}
 
+        let device = handle.device();
+
+        let config = device.active_config_descriptor()?;
+
+        info!("=== USB CONFIG DUMP ===");
+
+        for interface in config.interfaces() {
+            info!("Interface {}", interface.number());
+
+            for interface_desc in interface.descriptors() {
+                info!(
+                    "  Alt={} Class={:02x}",
+                    interface_desc.setting_number(),
+                    interface_desc.class_code()
+                );
+
+                for ep in interface_desc.endpoint_descriptors() {
+                    info!(
+                        "    EP=0x{:02x} attr=0x{:02x} max_packet={}",
+                        ep.address(),
+                        ep.transfer_type() as u8,
+                        ep.max_packet_size()
+                    );
+                }
+            }
+        }
+
+        info!("=======================");
+
         // interface を占有する。
         handle.claim_interface(0)?;
+        handle.set_alternate_setting(0, 0)?;
 
         // 通信路のリセット (詰まりの解消)
         let _ = handle.clear_halt(0x02);
@@ -85,19 +115,36 @@ impl UsbBusRusb {
         let usb_version = device_desc.usb_version();
 
         // USB 1.1 未満はエラーとする
-        if usb_version < rusb::Version(1, 1, 0) {
-            return Err(BusError::Other(format!(
-                "USB device requires at least USB 1.1"
-            )));
-        }
+        //if usb_version < rusb::Version(1, 1, 0) {
+        //    return Err(BusError::Other(format!(
+        //        "USB device requires at least USB 1.1"
+        //    )));
+        //}
 
         // USBバージョンに基づいて、バルク転送の最大サイズを決定
         // USB2.0 (0x0200) 以上なら 512、それ未満 (1.1など) なら 64
-        let max_bulk_size = if usb_version >= rusb::Version(2, 0, 0) {
-            512
-        } else {
-            64
-        };
+        //let max_bulk_size = if usb_version >= rusb::Version(2, 0, 0) {
+        //    512
+        //} else {
+        //    64
+        //};
+
+        let mut max_bulk_size = None;
+
+        if let Ok(config) = device.active_config_descriptor() {
+            for interface in config.interfaces() {
+                for desc in interface.descriptors() {
+                    for ep in desc.endpoint_descriptors() {
+                        if ep.transfer_type() == rusb::TransferType::Bulk {
+                            max_bulk_size = Some(ep.max_packet_size());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let max_bulk_size = max_bulk_size.unwrap_or(64);
 
         info!(
             "USB Version: {:04x}, Max Bulk Size: {}",
@@ -110,7 +157,7 @@ impl UsbBusRusb {
             ctrl_rx_ep: 0x81,
             stream_ep: 0x84,
             ctrl_timeout: Duration::from_millis(3000), // px4_usb_params.c px4_usb_params.ctrl_timeout から。
-            max_bulk_size,                             //max_bulk_size,
+            max_bulk_size: max_bulk_size as u32,       //max_bulk_size,
             is_streaming: Mutex::new(false),
             stop_flag: Arc::new(AtomicBool::new(false)),
             consumer_thread: Mutex::new(None),
@@ -143,8 +190,18 @@ impl BusOps for UsbBusRusb {
 
     // itedtv_bus.c の 99〜118 と思われる。
     fn stream_rx(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, BusError> {
-        let size = self.handle.read_bulk(self.stream_ep, buf, timeout)?;
-        Ok(size)
+        match self.handle.read_bulk(self.stream_ep, buf, timeout) {
+            Ok(size) => {
+                info!("stream_rx ok ep=0x{:02x} size={}", self.stream_ep, size);
+
+                Ok(size)
+            }
+            Err(e) => {
+                error!("stream_rx failed ep=0x{:02x} err={:?}", self.stream_ep, e);
+
+                Err(e.into())
+            }
+        }
     }
 
     // itedtv_bus.c の 411〜509 と思われる。
@@ -175,7 +232,12 @@ impl BusOps for UsbBusRusb {
         let handle_arc = self.handle.clone();
 
         // Producer と Consumer を繋ぐチャネル (容量が 128KB * 100 らしい)
-        let (raw_tx, raw_rx) = crossbeam_channel::bounded::<bytes::Bytes>(250); // ちょっと増やしてみた
+        let (raw_tx, raw_rx) = crossbeam_channel::bounded::<bytes::Bytes>(2000); // ちょっと増やしてみた
+
+        let mut buf = vec![0u8; 68 * 512];
+
+        // macOSのUSBエンドポイント(Data Toggle)をクリーンにリセットする
+        let _ = handle_arc.clear_halt(ep);
 
         // debug
         let packet_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -256,8 +318,6 @@ impl BusOps for UsbBusRusb {
             let span = tracing::info_span!("usb_producer_loop");
             let _enter = span.enter();
 
-            let mut buf = vec![0u8; 1024 * 1024];
-
             // debug
             let mut usb_bytes = 0u64;
             let mut internal_drop = 0u64;
@@ -269,6 +329,7 @@ impl BusOps for UsbBusRusb {
                     Ok(len) => {
                         // メモリコピー (128KBなら数usで終わる軽量処理、らしい)
                         let data = bytes::Bytes::copy_from_slice(&buf[..len]);
+                        //info!("read_bulk size={}", len);
 
                         // try_send を使い、PC側の処理が遅れても USB の読み取りは止めない
                         if let Err(_) = raw_tx.try_send(data) {
@@ -285,7 +346,12 @@ impl BusOps for UsbBusRusb {
                         continue;
                     }
                     Err(e) => {
-                        error!("stream read error: {:?}", e);
+                        error!(
+                            "stream read_bulk failed ep=0x{:02x} err={:?} buf_len={}",
+                            ep,
+                            e,
+                            buf.len()
+                        );
                         break;
                     }
                 }

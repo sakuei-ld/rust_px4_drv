@@ -648,13 +648,16 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 
     pub fn open_tuner(&mut self, target_idx: usize) -> Result<(), TunerError> {
-        // debug
-        info!("open_tuner(): target = {}", target_idx);
-
         // インデックスの範囲外アクセスを防ぐチェック
         if target_idx >= self.px4chrdev.len() {
             return Err(TunerError::InvalidArgument);
         }
+
+        // debug
+        info!(
+            "open_tuner(): target = {} open_count = {} opened = {:?}",
+            target_idx, self.open_count, self.px4chrdev[target_idx].is_opened
+        );
 
         // すでにオープンされている場合は、何もせず成功を返す
         if self.px4chrdev[target_idx].is_opened {
@@ -701,7 +704,10 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             return Err(TunerError::InvalidArgument);
         }
 
-        info!("Closing channel index: {}", target_idx);
+        info!(
+            "close_tuner(): target = {} open_count = {} opened = {}",
+            target_idx, self.open_count, self.px4chrdev[target_idx].is_opened
+        );
 
         // すでに閉じている場合は何もしない
         if !self.px4chrdev[target_idx].is_opened {
@@ -740,6 +746,11 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             self.backend_set_power(false)?;
         }
 
+        // debug
+        info!(
+            "close_tuner end target = {} open_count = {} opened = {:?}",
+            target_idx, self.open_count, self.px4chrdev[target_idx].is_opened
+        );
         Ok(())
     }
 

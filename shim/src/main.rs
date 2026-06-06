@@ -1,15 +1,19 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use signal_hook::consts::{SIGINT, SIGPIPE, SIGTERM};
+use signal_hook::flag;
+use time::UtcOffset;
+use tracing::{debug, error, info, instrument, warn};
+use tracing_subscriber::{
+    fmt, fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+};
+
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-
-use signal_hook::consts::{SIGINT, SIGPIPE, SIGTERM};
-use signal_hook::flag;
-
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 //use std::os::unix::net::UnixStream;
 use std::net::TcpStream;
 
@@ -125,6 +129,19 @@ fn resolve_tsid(space: &ChannelSpace, channel: u32, slot: u32) -> Option<u16> {
 }
 
 fn main() -> Result<()> {
+    // RUST_LOG 環境変数でレベルを制御可能にする (例: RUST_LOG=info ./daemon)
+    // log の表示時刻の設定
+    let timer = OffsetTime::new(
+        UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC),
+        time::format_description::well_known::Rfc3339,
+    );
+
+    // with_writer(std::io::stderr) が一般的らしい
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_writer(std::io::stdout).with_timer(timer))
+        .with(EnvFilter::from_default_env())
+        .init();
+
     // clap を用いて引数をパース
     let cli = Cli::parse();
 
@@ -184,18 +201,18 @@ fn main() -> Result<()> {
 
     // Daemon Server に接続
     let bind_addr = format!("{}:{}", cli.host, cli.tcp_port);
-    eprintln!("Connecting to daemon at {}...", bind_addr);
+    info!("Connecting to daemon at {}...", bind_addr);
 
     let mut stream = loop {
         //match UnixStream::connect(socket_path) {
         match TcpStream::connect(&bind_addr) {
             Ok(s) => {
-                eprintln!("Connected to daemon!");
+                info!("Connected to daemon!");
                 break s;
             }
             Err(e) => {
                 // 接続失敗した場合は 500ms 待ってから再試行
-                eprintln!("Failed to connect: {}. Retrying in 500ms...", e);
+                warn!("Failed to connect: {}. Retrying in 500ms...", e);
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
         }
@@ -226,10 +243,10 @@ fn main() -> Result<()> {
     let mut response = String::new();
     match reader.read_line(&mut response) {
         Ok(n) => {
-            eprintln!("read_line ok n={} response={:?}", n, response);
+            info!("read_line ok n={} response={:?}", n, response);
         }
         Err(e) => {
-            eprintln!(
+            error!(
                 "read_line err kind={:?} raw={:?}",
                 e.kind(),
                 e.raw_os_error()
@@ -264,7 +281,7 @@ fn main() -> Result<()> {
                 };
 
                 if let Err(e) = serde_json::to_writer(&stream, &get_signal) {
-                    eprintln!("Failed to send command: {}", e);
+                    error!("Failed to send command: {}", e);
                     break;
                 }
 
@@ -281,7 +298,7 @@ fn main() -> Result<()> {
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("Read error: {}", e);
+                        error!("Read error: {}", e);
                         break;
                     }
                 }
@@ -292,7 +309,7 @@ fn main() -> Result<()> {
                         let db = calculate_db(raw_cnr as u64, &space);
                         eprintln!("CNR: {:.2} dB (Raw: {})", db, raw_cnr);
                     } else {
-                        eprintln!(
+                        error!(
                             "Error: {}",
                             res.message.unwrap_or_else(|| "Unknown".to_string())
                         );
@@ -305,6 +322,8 @@ fn main() -> Result<()> {
             eprintln!("\nStopped.");
         }
         "tune" => {
+            info!("[shim] Sending StartStream...");
+
             // StartStream コマンドを送信
             let start_stream = DaemonCommand::StartStream {
                 port: port as usize,
@@ -313,24 +332,33 @@ fn main() -> Result<()> {
             serde_json::to_writer(&stream, &start_stream)?;
             stream.write_all(b"\n")?;
 
+            info!("[shim] Waiting for StartStream response...");
             response.clear();
             reader.read_line(&mut response)?;
 
+            info!("[shim] Received response: {}", response.trim());
             if !response.contains("\"status\":\"ok\"") {
+                // リトライが大量に出ないよう追加
+                std::thread::sleep(std::time::Duration::from_secs(1));
                 anyhow::bail!("StartStream failed");
             }
 
+            info!("[shim] Setting read timeouts...");
             stream.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
             reader
                 .get_mut()
                 .set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
+            info!(
+                "[shim] Opening output path: {}",
+                output_path.as_ref().unwrap()
+            );
             // --- 出力先の抽象化 ---
             let out_path = output_path.unwrap();
             let mut writer: Box<dyn Write> = if out_path == "-" {
                 Box::new(BufWriter::with_capacity(128 * 1024, std::io::stdout()))
             } else {
-                eprintln!("Recording to file: {}", out_path);
+                info!("Recording to file: {}", out_path);
                 Box::new(BufWriter::with_capacity(
                     128 * 1024,
                     File::create(&out_path)?,
@@ -341,6 +369,7 @@ fn main() -> Result<()> {
             // タイムアウトを設けることで、定期的に running フラグを確認できるようにする
             stream.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
+            info!("[shim] Starting stream copy loop...");
             let mut buf = [0u8; 8192]; // 8KB 程度のバッファ
 
             // debug
@@ -350,11 +379,15 @@ fn main() -> Result<()> {
             // running フラグを監視しながらループ
             while !term.load(Ordering::Acquire) {
                 match reader.read(&mut buf) {
-                    Ok(0) => break, // EOF (Daemonが切断された)
+                    Ok(0) => {
+                        info!("[shim] TCP Connection closed by Daemon (EOF).");
+                        break; // EOF (Daemonが切断された)
+                    }
                     Ok(n) => {
                         //if let Err(_) = stdout.write_all(&buf[..n]) {
-                        if let Err(_) = writer.write_all(&buf[..n]) {
+                        if let Err(e) = writer.write_all(&buf[..n]) {
                             // mirakc側がパイプを閉じたら書き込みエラーになるので、それを検知して終了
+                            error!("[shim] Write to output failed: {}", e);
                             break;
                         }
                         // debug
@@ -371,14 +404,17 @@ fn main() -> Result<()> {
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("Socket read error: {}", e);
+                        error!("Socket read error: {}", e);
+                        // 追加: 異常切断時は1秒待ってから終了し、無限ループ爆撃を防ぐ
+                        std::thread::sleep(std::time::Duration::from_secs(1));
                         break;
                     }
                 }
             }
             // 残りを書き出す
             writer.flush()?;
-            eprintln!("file bytes={}", file_bytes)
+            info!("file bytes={}", file_bytes);
+            info!("[shim] Exiting tune cleanly. file bytes={}", file_bytes);
         }
         _ => {
             anyhow::bail!("Invalid mode: {}", mode);

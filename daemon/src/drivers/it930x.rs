@@ -862,17 +862,32 @@ impl<B: BusOps> IT930x<B> {
 
         // 3. ストリーム受信 (ITEDTV_BUS_USB の呼び出し)
         // bus.stream_rx が [u8] を受け取り、実際に読み込んだ長さを返す設計にします
-        let read_len = self
-            .bus
-            .stream_rx(&mut buf, timeout)
-            .map_err(CtrlMsgError::Bus)?;
+        //let read_len = self
+        //    .bus
+        //    .stream_rx(&mut buf, timeout)
+        //    .map_err(CtrlMsgError::Bus)?;
+
+        let result = self.bus.stream_rx(&mut buf, timeout);
 
         // 4. パージの無効化
         // エラーハンドリングについては、パージ後の状態を優先させるため、
         // 処理の成功/失敗に関わらずレジスタを戻すのが安全です
         let _ = self.write_reg_mask(0xda1d, 0x00, 0x01);
 
-        info!("purge_psb: read_len: {}", read_len);
+        let read_len = match result {
+            Ok(len) => {
+                info!("purge_psb: stream_rx len={}", len);
+                len
+            }
+
+            Err(e) => {
+                error!("purge_psb: stream_rx error={:?}", e);
+
+                let _ = self.write_reg_mask(0xda1d, 0x00, 0x01);
+
+                return Err(CtrlMsgError::Bus(e));
+            }
+        };
 
         // 5. 判定処理 (Cの if (len == 512) に相当)
         if read_len == 512 {

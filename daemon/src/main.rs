@@ -311,6 +311,14 @@ fn main() -> anyhow::Result<()> {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false);
 
+                    // 1. 低遅延モードの有効化
+                    let _ = stream.set_nodelay(true);
+
+                    // 2. OSの送信バッファを明示的に拡大 (例: 4MB)
+                    // これにより、ネットワークが少し揺らいでも数秒分のTSデータをOS側でバッファリングできます
+                    let sock = socket2::SockRef::from(&stream);
+                    let _ = sock.set_send_buffer_size(256 * 1024);
+
                     let rx_clone = Arc::clone(&shared_receivers);
                     let dev_clone = Arc::clone(&shared_device);
 
@@ -681,8 +689,10 @@ impl<'a, B: BusOps + Send + Sync> Drop for ClientGuard<'a, B> {
         // クライアント切断時(エラー終了含む)に必ずキャプチャを停止し、チューナーを閉じる
         if let Some(port) = self.port {
             if let Ok(mut dev) = self.device.lock() {
+                info!("ClientGuard cleanup start");
                 let _ = dev.set_capture(port, false);
                 let _ = dev.close_tuner(port);
+                info!("ClientGuard cleanup end");
 
                 info!("ClientGuard: Cleaned up port {} on disconnect.", port);
             }
