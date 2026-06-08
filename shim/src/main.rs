@@ -356,11 +356,13 @@ fn main() -> Result<()> {
             // --- 出力先の抽象化 ---
             let out_path = output_path.unwrap();
             let mut writer: Box<dyn Write> = if out_path == "-" {
-                Box::new(BufWriter::with_capacity(128 * 1024, std::io::stdout()))
+                //Box::new(BufWriter::with_capacity(128 * 1024, std::io::stdout()))
+                Box::new(BufWriter::with_capacity(188 * 1024, std::io::stdout()))
             } else {
                 info!("Recording to file: {}", out_path);
                 Box::new(BufWriter::with_capacity(
-                    128 * 1024,
+                    //128 * 1024,
+                    188 * 1024,
                     File::create(&out_path)?,
                 ))
             };

@@ -45,7 +45,8 @@ impl ClientIo {
     pub fn new(stream: TcpStream) -> std::io::Result<Self> {
         Ok(Self {
             reader: BufReader::new(stream.try_clone()?),
-            writer: BufWriter::with_capacity(128 * 1024, stream),
+            //writer: BufWriter::with_capacity(128 * 1024, stream),
+            writer: BufWriter::with_capacity(188 * 1024, stream),
             socket_sent_bytes: 0,
             socket_write_calls: 0,
         })
@@ -410,11 +411,35 @@ fn handle_client<B: BusOps + Send + Sync>(
                                         }
 
                                         info!("Attempting open tuner: {}", port);
-                                        // 他のクライアントが使用中であれば、ここでエラー(InvalidState)になる
-                                        if let Err(e) = dev.open_tuner(port) {
-                                            send_error(&mut io, format!("{}", e));
-                                            return;
+                                        let mut retry = 0;
+                                        loop {
+                                            match dev.open_tuner(port) {
+                                                // 成功
+                                                Ok(_) => break,
+                                                // 失敗時はリトライ
+                                                Err(e) => {
+                                                    if retry >= 20 {
+                                                        // 最大約2秒待ってもダメなら本当にエラー
+                                                        send_error(
+                                                            &mut io,
+                                                            format!("Tuner busy timeout: {}", e),
+                                                        );
+                                                        return;
+                                                    }
+
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_millis(100),
+                                                    );
+                                                    retry += 1;
+                                                }
+                                            }
                                         }
+
+                                        // 他のクライアントが使用中であれば、ここでエラー(InvalidState)になる
+                                        //if let Err(e) = dev.open_tuner(port) {
+                                        //    send_error(&mut io, format!("{}", e));
+                                        //    return;
+                                        //}
 
                                         // クリーンアップ用にポートを記憶
                                         guard.port = Some(port);
@@ -546,6 +571,11 @@ fn handle_client<B: BusOps + Send + Sync>(
                                         // ptx_chrdev.c ptx_chrdev_unlock_ioctl(): switch PTX_START_STREAMING 相当
                                         // recisdb では check signal とかの前に処理しちゃうので。
                                         info!("Attempting set capture(status: true)");
+
+                                        // 追加：キャプチャを開始する直前に、キューに溜まっている過去のゴミTSパケットを全破棄する
+                                        //if let Some(rx) = receivers.get(port) {
+                                        //    while let Ok(_) = rx.try_recv() {}
+                                        //}
 
                                         // SetCapture を true に
                                         if let Err(e) = dev.set_capture(port, true) {
