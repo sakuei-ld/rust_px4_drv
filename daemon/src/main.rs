@@ -427,10 +427,14 @@ fn handle_client<B: BusOps + Send + Sync>(
                                                         return;
                                                     }
 
+                                                    drop(dev);
+
                                                     std::thread::sleep(
                                                         std::time::Duration::from_millis(100),
                                                     );
                                                     retry += 1;
+
+                                                    dev = px4_device.lock().unwrap();
                                                 }
                                             }
                                         }

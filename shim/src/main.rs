@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use signal_hook::consts::{SIGINT, SIGPIPE, SIGTERM};
 use signal_hook::flag;
 use time::UtcOffset;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{
     fmt, fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
@@ -106,7 +106,7 @@ fn resolve_tsid(space: &ChannelSpace, channel: u32, slot: u32) -> Option<u16> {
                 (5, 1) => Some(17489),  // WOWOWシネマ
                 (9, 0) => Some(16528),  // BS11
                 (9, 1) => Some(16529),  // スターチャンネル等
-                (13, 0) => Some(16592), // BS日テレ  👈 今回上手くいかなかったチャンネル
+                (13, 0) => Some(16592), // BS日テレ
                 (13, 1) => Some(16593), // BSフジ
                 (19, 0) => Some(16689), // NHK BS 4K
                 (21, 0) => Some(16721), // グリーンチャンネル
@@ -138,7 +138,7 @@ fn main() -> Result<()> {
 
     // with_writer(std::io::stderr) が一般的らしい
     tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stdout).with_timer(timer))
+        .with(fmt::layer().with_writer(std::io::stderr).with_timer(timer))
         .with(EnvFilter::from_default_env())
         .init();
 
