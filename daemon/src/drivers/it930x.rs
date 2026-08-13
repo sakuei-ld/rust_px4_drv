@@ -211,6 +211,17 @@ const IT930X_CMD_FW_SCATTER_WRITE: u16 = 0x0029;
 const IT930X_CMD_I2C_READ: u16 = 0x002a;
 const IT930X_CMD_I2C_WRITE: u16 = 0x002b;
 
+// UART/Smart Card commands (it930x.h)
+const IT930X_CMD_UART_READ: u16 = 0x0033;
+const IT930X_CMD_UART_WRITE: u16 = 0x0034;
+const IT930X_CMD_UART_SET_BAUDRATE: u16 = 0x0035;
+const IT930X_CMD_UART_SET_MODE: u16 = 0x0037;
+
+// UART/Smart Card registers (it930x.c)
+const IT930X_REG_UART_RX_READY: u32 = 0x496a;
+const IT930X_REG_UART_RX_LENGTH: u32 = 0x496b;
+const IT930X_REG_UART_REALSEND: u32 = 0x4965;
+
 // it930x.c 44 〜 56 の移植
 fn reg_length(reg: u32) -> u8 {
     match reg {
@@ -375,6 +386,22 @@ pub enum GpioMode {
     Out,
 }
 
+// UART baudrate settings (it930x.h: enum it930x_uart_baudrate)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UartBaudrate {
+    Baudrate9600 = 0,
+    Baudrate19200 = 1,
+    Baudrate38400 = 2,
+    Baudrate57600 = 245,
+    Baudrate115200 = 250,
+}
+
+impl UartBaudrate {
+    pub fn as_value(self) -> u8 {
+        self as u8
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GpioStatus {
     mode: GpioMode,
@@ -408,7 +435,7 @@ impl<B: BusOps> IT930x<B> {
             | ((rbuf[2] as u32) << 8)
             | (rbuf[3] as u32);
 
-        return Ok(fw_version);
+        Ok(fw_version)
     }
 
     // it930x.c 619〜630 をそのまま移植
@@ -513,7 +540,7 @@ impl<B: BusOps> IT930x<B> {
             (fw_version >> 8) & 0xff,
             fw_version & 0xff
         );
-        return Ok(());
+        Ok(())
     }
 
     pub fn config_i2c(&self) -> Result<(), CtrlMsgError> {
@@ -973,6 +1000,204 @@ impl<B: BusOps> IT930x<B> {
             ctrl_lock: Mutex::new(()),
             i2c_lock: Mutex::new(()),
             gpio_status: Mutex::new([GpioStatus::default(); 16]),
+        }
+    }
+}
+
+// UART/Smart Card functions (it930x.c: UART/Smart Card functions)
+impl<B: BusOps> IT930x<B> {
+    /// Set UART baudrate (it930x_set_uart_baudrate)
+    pub fn set_uart_baudrate(&self, baudrate: UartBaudrate) -> Result<(), CtrlMsgError> {
+        let val = baudrate.as_value();
+        self.ctrl_msg(IT930X_CMD_UART_SET_BAUDRATE, &[val], &mut [])
+    }
+
+    /// Send UART data in chunks of 48 bytes (it930x_send_uart_data)
+    pub fn send_uart_data(&self, data: &[u8]) -> Result<(), CtrlMsgError> {
+        if data.is_empty() {
+            return Err(CtrlMsgError::InvalidArgument);
+        }
+
+        let mut buf_idx = 0;
+        let mut write_len = data.len();
+
+        while write_len > 0 {
+            let mut write_buf = [0u8; 49];
+
+            if write_len > 48 {
+                write_buf[0] = 48;
+                for i in 0..48 {
+                    write_buf[i + 1] = data[buf_idx + i];
+                }
+
+                self.ctrl_msg(IT930X_CMD_UART_WRITE, &write_buf, &mut [])?;
+                buf_idx += 48;
+                write_len -= 48;
+            } else {
+                write_buf[0] = write_len as u8;
+                for i in 0..write_len {
+                    write_buf[i + 1] = data[buf_idx + i];
+                }
+
+                self.ctrl_msg(IT930X_CMD_UART_WRITE, &write_buf[..write_len + 1], &mut [])?;
+                buf_idx += write_len;
+                write_len = 0;
+            }
+        }
+
+        Ok(())
+    }
+
+    // ---- B-CAS/Smart Card functions (it930x_bcas_*) ----
+
+    /// Initialize B-CAS card mode (it930x_bcas_init)
+    pub fn bcas_init(&self) -> Result<(), CtrlMsgError> {
+        let val: u8 = 1;
+        self.ctrl_msg(IT930X_CMD_UART_SET_MODE, &[val], &mut [])
+    }
+
+    /// Reset B-CAS card (it930x_bcas_reset_card)
+    pub fn bcas_reset_card(&self) -> Result<(), CtrlMsgError> {
+        // Enable GPIO H14 as output
+        self.set_gpio_mode(14, GpioMode::Out, true)?;
+
+        // Set GPIO H14 low (assert reset)
+        self.write_gpio(14, false)?;
+
+        // Set UART status register
+        self.write_regs(0x7904, &[2])?;
+
+        // Set UART baudrate to 9600
+        self.set_uart_baudrate(UartBaudrate::Baudrate9600)?;
+
+        // Wait 5ms (Linux kernel: msleep(5))
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Set GPIO H14 high (release reset)
+        self.write_gpio(14, true)?;
+
+        Ok(())
+    }
+
+    /// Check if UART RX is ready (it930x_bcas_check_ready)
+    pub fn bcas_check_ready(&self) -> Result<bool, CtrlMsgError> {
+        let mut val = [0u8; 1];
+        self.read_regs(IT930X_REG_UART_RX_READY, &mut val)?;
+        Ok(val[0] != 0)
+    }
+
+    /// Get data from B-CAS card (it930x_bcas_get_data)
+    /// Get data from B-CAS card (it930x_bcas_get_data)
+    pub fn bcas_get_data(&self, buf: &mut [u8]) -> Result<usize, CtrlMsgError> {
+        if buf.is_empty() {
+            return Err(CtrlMsgError::InvalidArgument);
+        }
+
+        let mut index = 0usize;
+
+        if buf.len() > 32 {
+            // 32バイトずつ分割して読み込む
+            while index < buf.len() {
+                let mut temp = [0u8; 1];
+                self.read_regs(IT930X_REG_UART_RX_LENGTH, &mut temp)?;
+
+                if temp[0] == 0 {
+                    break;
+                }
+
+                // デバイス側の残量・呼び出し側バッファの残量、両方でクランプする
+                let remaining = buf.len() - index;
+                let read_len = (temp[0] as usize).min(32).min(remaining) as u8;
+
+                if read_len == 0 {
+                    break;
+                }
+
+                let wb = [read_len];
+                let mut rb = [0u8; 32];
+                self.ctrl_msg(IT930X_CMD_UART_READ, &wb, &mut rb[..read_len as usize])?;
+
+                buf[index..index + read_len as usize].copy_from_slice(&rb[..read_len as usize]);
+                index += read_len as usize;
+            }
+            Ok(index)
+        } else {
+            // 1回で読み込む
+            let mut rx_len = [0u8; 1];
+            self.read_regs(IT930X_REG_UART_RX_LENGTH, &mut rx_len)?;
+
+            if rx_len[0] == 0 {
+                return Ok(0);
+            }
+
+            // デバイス報告長がバッファより大きい場合はクランプする
+            let read_len = (rx_len[0] as usize).min(buf.len()) as u8;
+
+            let wb = [read_len];
+            self.ctrl_msg(IT930X_CMD_UART_READ, &wb, &mut buf[..read_len as usize])?;
+
+            Ok(read_len as usize)
+        }
+    }
+
+    /// Send data to B-CAS card (it930x_bcas_send_data)
+    pub fn bcas_send_data(&self, data: &[u8]) -> Result<(), CtrlMsgError> {
+        if data.is_empty() || data.len() > 255 {
+            return Err(CtrlMsgError::InvalidArgument);
+        }
+
+        let mut buf_idx = 0;
+        let mut write_len = data.len();
+
+        while write_len > 0 {
+            let mut write_buf = [0u8; 49];
+
+            // Copy data to buffer (skip first byte which is length)
+            for i in 0..48 {
+                if buf_idx + i < data.len() {
+                    write_buf[i + 1] = data[buf_idx + i];
+                }
+            }
+
+            if write_len > 48 {
+                write_buf[0] = 48;
+                self.ctrl_msg(IT930X_CMD_UART_WRITE, &write_buf, &mut [])?;
+                buf_idx += 48;
+                write_len -= 48;
+            } else {
+                // Set real send flag before last chunk
+                self.write_regs(IT930X_REG_UART_REALSEND, &[1])?;
+
+                write_buf[0] = write_len as u8;
+                self.ctrl_msg(IT930X_CMD_UART_WRITE, &write_buf[..write_len + 1], &mut [])?;
+                buf_idx += write_len;
+                write_len = 0;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Detect if B-CAS card is present (it930x_bcas_detect_card)
+    pub fn bcas_detect_card(&self) -> Result<bool, CtrlMsgError> {
+        // Configure GPIO H6 as input
+        self.set_gpio_mode(6, GpioMode::In, true)?;
+
+        // Read GPIO H6 input
+        let detected = self.read_gpio(6)?;
+
+        // Card is detected when GPIO is low (active low)
+        Ok(!detected)
+    }
+
+    /// Set B-CAS specific baudrate (it930x_bcas_set_baudrate)
+    pub fn bcas_set_baudrate(&self, baudrate: UartBaudrate) -> Result<(), CtrlMsgError> {
+        match baudrate {
+            UartBaudrate::Baudrate9600 | UartBaudrate::Baudrate19200 => {
+                let val = baudrate.as_value();
+                self.ctrl_msg(IT930X_CMD_UART_SET_BAUDRATE, &[val], &mut [])
+            }
+            _ => Err(CtrlMsgError::InvalidArgument),
         }
     }
 }

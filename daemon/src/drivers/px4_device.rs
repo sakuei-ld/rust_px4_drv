@@ -421,6 +421,11 @@ pub struct Px4Device<'a, B: BusOps + Sync> {
 }
 
 impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
+    /// Get a reference to the underlying IT930x device (wrapped in Option for API compatibility)
+    pub fn get_it930x(&self) -> Option<&'a IT930x<B>> {
+        Some(self.it930x)
+    }
+
     pub fn new(
         it930x: &'a IT930x<B>,
         use_mldev: bool,
