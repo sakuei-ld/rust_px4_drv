@@ -382,6 +382,7 @@ impl Default for IT930xConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpioMode {
+    Undefined,
     In,
     Out,
 }
@@ -411,7 +412,7 @@ struct GpioStatus {
 impl Default for GpioStatus {
     fn default() -> Self {
         Self {
-            mode: GpioMode::In,
+            mode: GpioMode::Undefined,
             enable: false,
         }
     }
@@ -683,7 +684,7 @@ impl<B: BusOps> IT930x<B> {
         enable: bool,
     ) -> Result<(), CtrlMsgError> {
         // debug
-        info!("set_gpio_mode()");
+        //info!("set_gpio_mode()");
 
         const GPIO_EN_REGS: [u32; 16] = [
             0xd8b0, 0xd8b8, 0xd8b4, 0xd8c0, 0xd8bc, 0xd8c8, 0xd8c4, 0xd8d0, 0xd8cc, 0xd8d8, 0xd8d4,
@@ -697,6 +698,7 @@ impl<B: BusOps> IT930x<B> {
         let val = match mode {
             GpioMode::In => 0u8,
             GpioMode::Out => 1u8,
+            GpioMode::Undefined => return Err(CtrlMsgError::InvalidArgument),
         };
 
         let idx = (gpio - 1) as usize;
@@ -706,6 +708,9 @@ impl<B: BusOps> IT930x<B> {
         if status[idx].mode == mode {
             return Ok(());
         }
+
+        // debug (モードが変わった場合だけ表示)
+        info!("set_gpio_mode(gpio={}, mode={:?})", gpio, mode);
 
         status[idx].mode = mode;
         self.write_regs(GPIO_EN_REGS[idx], &[val])?;
@@ -1058,6 +1063,7 @@ impl<B: BusOps> IT930x<B> {
 
     /// Reset B-CAS card (it930x_bcas_reset_card)
     pub fn bcas_reset_card(&self) -> Result<(), CtrlMsgError> {
+        info!("bcas_reset_card().");
         // Enable GPIO H14 as output
         self.set_gpio_mode(14, GpioMode::Out, true)?;
 
@@ -1071,7 +1077,8 @@ impl<B: BusOps> IT930x<B> {
         self.set_uart_baudrate(UartBaudrate::Baudrate9600)?;
 
         // Wait 5ms (Linux kernel: msleep(5))
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // カードと IC が安定するまでしっかり待つ (5ms -> 100ms に変更)
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Set GPIO H14 high (release reset)
         self.write_gpio(14, true)?;

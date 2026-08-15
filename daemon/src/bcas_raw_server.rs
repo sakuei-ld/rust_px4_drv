@@ -14,64 +14,56 @@ use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
 use crate::drivers::itedtv_bus::BusOps;
-use crate::drivers::px4_card::{BcasCard, SmartCardInterface};
-use crate::error::DaemonResult;
+use crate::drivers::px4_card::{BcasCard, SmartCardError, SmartCardInterface};
+use crate::drivers::px4_device::Px4Device;
+use crate::error::{DaemonError, DaemonResult};
 use crate::server::SHUTDOWN;
+
+// 最大リトライ回数とインターバルを設定
+const MAX_RETRIES: usize = 3;
+const RETRY_INTERVAL_MS: u64 = 200;
 
 /// カードの抜き差しを監視し、必要なら再初期化する。
 /// bcs-perl.pl のメインループにおける Status() チェック相当。
 ///
 /// このループは、main.rs の外側の `std::thread::scope` の中で
 /// `s.spawn(...)` により起動されることを前提とする（'static を要求しない）。
-pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(card: Arc<Mutex<BcasCard<'a, B>>>) {
+pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(device: Arc<Mutex<Px4Device<'a, B>>>) {
     loop {
         if SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
             tracing::info!("[bcas] Card monitor loop shutting down");
             break;
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_secs(1));
 
         // SHUTDOWNが立った直後にsleepから復帰した場合に備えて再確認
         if SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
 
-        let card_guard = match card.lock() {
+        let mut dev = match device.lock() {
             Ok(g) => g,
             Err(e) => {
-                tracing::error!("BCAS card mutex poisoned: {}", e);
+                tracing::error!("Px4Device mutex poisoned: {}", e);
                 continue;
             }
         };
 
+        // カードが検出されているか確認
+        let detected = dev.card_detect().unwrap_or(false);
+
         // カードが検出されない場合、再初期化を試みる
-        if !card_guard.detect().unwrap_or(false) {
+        if !detected {
             tracing::warn!("BCAS card not detected, attempting re-initialization");
-            drop(card_guard); // ロックを解放してから再初期化
 
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            let mut card_guard = match card.lock() {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::error!("BCAS card mutex poisoned during re-init: {}", e);
-                    continue;
+            // 一時的に電源を入れて再リセットを試みる
+            if dev.card_acquire().is_ok() {
+                match dev.card_full_reset() {
+                    Ok(_) => tracing::info!("BCAS card re-initialized successfully"),
+                    Err(e) => tracing::warn!("BCAS card re-initialization failed: {}", e),
                 }
-            };
-
-            match card_guard.reset() {
-                Ok(_card_info) => {
-                    // ATR検証を実行 - B-CASカードであることを確認
-                    if let Err(e) = card_guard.verify_atr() {
-                        tracing::warn!("re-initialized card has unexpected ATR: {}", e);
-                    } else {
-                        tracing::info!("BCAS card re-initialized successfully");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("BCAS card re-initialization failed: {}", e);
-                }
+                let _ = dev.card_release();
             }
         }
     }
@@ -82,7 +74,7 @@ pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(card: Arc<Mutex<BcasCard<'
 /// main.rs の scoped thread から呼び出されることを想定している。
 pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
     mut stream: TcpStream,
-    card: Arc<Mutex<BcasCard<'_, B>>>,
+    device: Arc<Mutex<Px4Device<'_, B>>>,
 ) -> DaemonResult<()> {
     let peer = stream
         .peer_addr()
@@ -90,11 +82,33 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
         .unwrap_or_default();
     info!("BCAS raw client connected: {}", peer);
 
-    // 読み取りタイムアウトを設定し、定期的にSHUTDOWNを確認できるようにする
+    // 1. クライアント接続開始時に card_acquire を呼ぶ
+    {
+        let mut dev = device
+            .lock()
+            .map_err(|e| DaemonError::Unknown(format!("Mutex poisoned: {}", e)))?;
+        if let Err(e) = dev.card_acquire() {
+            error!("Failed to acquire card for client {}: {:?}", peer, e);
+            return Ok(());
+        }
+    }
+
+    // クライアント切断時に確実にな card_release されるようにスコープガードを仕込む
+    // （または struct の Drop や defer パターン）
+    struct CardGuard<'a, B: BusOps + Send + Sync>(Arc<Mutex<Px4Device<'a, B>>>);
+    impl<'a, B: BusOps + Send + Sync> Drop for CardGuard<'a, B> {
+        fn drop(&mut self) {
+            if let Ok(mut dev) = self.0.lock() {
+                let _ = dev.card_release();
+            }
+        }
+    }
+
+    let _guard = CardGuard(Arc::clone(&device));
+
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
 
     while !SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
-        // 1バイトの長さフィールドを読み込む
         let mut len_buf = [0u8; 1];
         match stream.read_exact(&mut len_buf) {
             Ok(()) => {}
@@ -102,43 +116,72 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                // タイムアウトはデータが来ていないだけなので、SHUTDOWNを確認して継続
                 continue;
             }
-            Err(_) => break, // EOF/その他のエラーは切断
+            Err(_) => break,
         }
 
         let len = len_buf[0] as usize;
-
-        // 長さ0は明示的な切断要求
         if len == 0 {
             info!("BCAS raw client sent length=0, disconnecting: {}", peer);
             break;
         }
 
-        // APDUデータを読み込む
         let mut req = vec![0u8; len];
-        // データ部分もタイムアウトしうるが、長さが分かった以上は最後まで読み切りたいので
-        // read_exact のままでよい（タイムアウト時はエラーとして切断）
         if stream.read_exact(&mut req).is_err() {
             warn!("failed to read {} bytes from client: {}", len, peer);
             break;
         }
 
-        // カードにAPDUを送信し、応答を取得
         let res = {
-            let mut card_guard = card.lock().unwrap();
-            match card_guard.transceive_raw(&req) {
-                Ok(res) => res,
-                Err(e) => {
-                    error!("card transceive failed: {}", e);
-                    // エラー時は当該クライアント接続だけを切断
-                    break;
+            let mut attempt = 0;
+            loop {
+                let mut dev = match device.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        error!("Px4Device mutex poisoned: {}", e);
+                        break Err(e.to_string());
+                    }
+                };
+
+                // Px4Device 側の card_transceive を呼び出す
+                match dev.card_transceive(&req) {
+                    Ok(res) => break Ok(res),
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt > MAX_RETRIES {
+                            error!(
+                                "card transceive failed after {} attempts: {} (client: {})",
+                                MAX_RETRIES, e, peer
+                            );
+                            break Err(e.to_string());
+                        }
+
+                        warn!(
+                            "card transceive failed ({}), retrying ({}/{}) for client: {}",
+                            e, attempt, MAX_RETRIES, peer
+                        );
+
+                        let needs_immediate_reset = matches!(&e, SmartCardError::Protocol(msg) if msg.contains("No protocol selected"));
+
+                        if needs_immediate_reset || attempt >= MAX_RETRIES {
+                            if let Err(reset_err) = dev.card_full_reset() {
+                                warn!("failed to reset BCAS card during retry: {}", reset_err);
+                            }
+                        }
+
+                        drop(dev);
+                        std::thread::sleep(std::time::Duration::from_millis(RETRY_INTERVAL_MS));
+                    }
                 }
             }
         };
 
-        // 応答が255バイトを超える場合はエラー（1バイト長プレフィックスで表現できない）
+        let res = match res {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
         if res.len() > 255 {
             error!(
                 "response too large for 1-byte length prefix: {} bytes (client: {})",
@@ -148,7 +191,6 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
             break;
         }
 
-        // レスポンスを送信: [1バイトの長さ][応答バイト列]
         let mut out = Vec::with_capacity(res.len() + 1);
         out.push(res.len() as u8);
         out.extend_from_slice(&res);

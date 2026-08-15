@@ -221,75 +221,64 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                             } => {
                                 match channel_to_freq_khz(&channel) {
                                     Ok(freq_khz) => {
-                                        let mut dev = match px4_device.lock() {
-                                            Ok(g) => g,
-                                            Err(e) => {
-                                                send_error(&mut io, format!("Lock error: {}", e));
-                                                continue;
-                                            }
-                                        };
-
-                                        // チャンネル切り替え時の処理
-                                        // 現在のクライアントが確保しているポートと違う場合のみオープン処理
-                                        // 既に別のポートを開いていたなら、それを閉じて返却する
+                                        // 1. 古いポートの停止処理（必要な場合）
                                         if let Some(old_port) = guard.port {
-                                            let _ = dev.set_capture(old_port, false);
-                                            // 別ポートへの切り替えの場合は、古いポートをクローズする
-                                            if old_port != port {
-                                                let _ = dev.close_tuner(old_port);
+                                            if let Ok(mut dev) = px4_device.lock() {
+                                                let _ = dev.set_capture(old_port, false);
+                                                if old_port != port {
+                                                    let _ = dev.close_tuner(old_port);
+                                                    guard.port = None;
+                                                }
                                             }
                                         }
 
+                                        // 2. チューナーのオープン処理（リトライ付き）
                                         tracing::info!("Attempting open tuner: {}", port);
                                         let mut retry = 0;
                                         let mut opened = false;
+
                                         while retry <= 20 {
-                                            match px4_device.lock() {
-                                                Ok(mut d) => {
-                                                    match d.open_tuner(port) {
-                                                        Ok(_) => {
-                                                            opened = true;
-                                                            // dev を更新するために外側でも使えるようにする
-                                                            // open_tuner に成功したのでループを抜ける
-                                                            drop(d);
-                                                            break;
-                                                        }
-                                                        Err(e) => {
-                                                            if retry >= 20 {
-                                                                send_error(
-                                                                    &mut io,
-                                                                    format!(
-                                                                        "Tuner busy timeout: {}",
-                                                                        e
-                                                                    ),
-                                                                );
-                                                                return;
-                                                            }
-                                                            std::thread::sleep(
-                                                                Duration::from_millis(100),
-                                                            );
-                                                            retry += 1;
-                                                        }
+                                            // スコープを作ってブロック終了時に即座に lock を解放（drop）させる
+                                            let open_result = {
+                                                match px4_device.lock() {
+                                                    Ok(mut dev) => dev.open_tuner(port),
+                                                    Err(e) => {
+                                                        send_error(
+                                                            &mut io,
+                                                            format!("Lock error: {}", e),
+                                                        );
+                                                        break;
                                                     }
                                                 }
+                                            };
+
+                                            match open_result {
+                                                Ok(_) => {
+                                                    opened = true;
+                                                    break;
+                                                }
                                                 Err(e) => {
-                                                    send_error(
-                                                        &mut io,
-                                                        format!("Lock error: {}", e),
-                                                    );
+                                                    if retry >= 20 {
+                                                        send_error(
+                                                            &mut io,
+                                                            format!("Tuner busy timeout: {}", e),
+                                                        );
+                                                        break;
+                                                    }
                                                     std::thread::sleep(Duration::from_millis(100));
                                                     retry += 1;
                                                 }
                                             }
                                         }
 
-                                        // open_tuner の結果に応じて処理を継続/エラー
                                         if !opened {
-                                            // エラーは上記のループ内で既に送信済み
                                             continue;
                                         }
 
-                                        // open_tuner 成功后、dev を取得して続きを処理
+                                        // クリーンアップ用にポートを記憶
+                                        guard.port = Some(port);
+
+                                        // 3. チューニングおよび各種設定（単一のロックでまとめて処理）
                                         let mut dev = match px4_device.lock() {
                                             Ok(g) => g,
                                             Err(e) => {
@@ -298,11 +287,7 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                             }
                                         };
 
-                                        // クリーンアップ用にポートを記憶
-                                        guard.port = Some(port);
-
                                         // ストリーミング中であれば、一度止める(安全のため)
-                                        // チャンネル切り替え時の割り込みを防ぎ、安全に Tune する
                                         let _ = dev.set_capture(port, false);
 
                                         // ISDB-S かつ 「Tune前にStreamIDを設定する」タイプの場合
@@ -327,13 +312,11 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                         let mut loop_count = 0;
 
                                         loop {
-                                            // 復調器が信号をロックしたか確認
                                             if let Ok(true) = dev.check_lock(port) {
                                                 locked = true;
                                                 break;
                                             }
 
-                                            // タイムアウトチェック
                                             if start_time.elapsed().as_millis() >= TIMEOUT_MS {
                                                 break;
                                             }
@@ -342,14 +325,11 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                             loop_count += 1;
                                         }
 
-                                        // lock が取れなかったら、ここで終わらす
                                         if !locked {
                                             tracing::warn!(
                                                 "[warn] Tuner did not lock in time on port {}",
                                                 port
                                             );
-
-                                            // ロックに失敗した場合はエラー（または警告）を返す
                                             send_error(&mut io, "Tuner did not lock");
                                             continue;
                                         }
@@ -379,13 +359,11 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                         }
 
                                         // LNB電源設定
-                                        let is_satellite = match channel.space {
+                                        let is_satellite = matches!(
+                                            channel.space,
                                             protocol::ChannelSpace::BroadcastingSatellite
-                                            | protocol::ChannelSpace::CommunicationSatellite => {
-                                                true
-                                            }
-                                            _ => false,
-                                        };
+                                                | protocol::ChannelSpace::CommunicationSatellite
+                                        );
 
                                         if is_satellite {
                                             tracing::info!(
@@ -394,7 +372,6 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                             );
 
                                             if let Some(mode) = lnb_voltage {
-                                                // ドライバが 0 か 15 しか受け付けないなら、ここで明示的に変換する
                                                 let target_voltage = match mode {
                                                     protocol::LnbMode::Off => 0,
                                                     protocol::LnbMode::Volt11 => 15,
@@ -412,14 +389,13 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                                         &mut io,
                                                         format!("LNB voltage set failed: {}", e),
                                                     );
-                                                    return;
+                                                    continue;
                                                 }
                                             }
                                         }
 
                                         // キャプチャ開始
                                         tracing::info!("Attempting set capture(status: true)");
-
                                         if let Err(e) = dev.set_capture(port, true) {
                                             send_error(&mut io, format!("Capture error: {}", e));
                                             continue;
@@ -429,7 +405,6 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                         send_ok(&mut io);
                                     }
                                     Err(e) => {
-                                        // 不適切な設定（エラー）だった場合はクライアントに通知
                                         send_error(&mut io, format!("{:?}", e));
                                     }
                                 }

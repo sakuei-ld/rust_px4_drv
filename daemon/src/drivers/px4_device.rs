@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::drivers::it930x::{CtrlMsgError, GpioMode, IT930x, PidFilter};
 use crate::drivers::itedtv_bus::BusOps;
+use crate::drivers::px4_card::{BcasCard, CardInfo, SmartCardError};
 use crate::drivers::r850::R850;
 use crate::drivers::rt710::RT710;
 use crate::drivers::tc90522::{System, TunerError};
@@ -418,6 +419,9 @@ pub struct Px4Device<'a, B: BusOps + Sync> {
 
     // PX-Q3U4 かつ multi device として使う場合に true をセットする。
     use_mldev: bool,
+
+    card: Option<BcasCard<'a, B>>,
+    card_open_count: usize,
 }
 
 impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
@@ -548,6 +552,8 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             lnb_power_count: 0,
             streaming_count: 0,
             use_mldev: use_mldev,
+            card: Some(BcasCard::new(&it930x)),
+            card_open_count: 0,
         };
 
         Ok((device, receivers))
@@ -640,8 +646,12 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     // px4_chrdev_open の中で、open_count が 0 のときの処理を抽出
     fn init(&mut self) -> Result<(), TunerError> {
         info!("First tuner open requested. Powering on backend hardware...");
-        // 295行目
-        self.backend_set_power(true)?;
+
+        // BCAS 向けに改造 (以前は if 文なし)
+        // Cコードの `if (!px4->card_open_count) px4_backend_set_power(px4, true);` に相当
+        if self.card_open_count == 0 {
+            self.backend_set_power(true)?;
+        }
 
         // 310行目 (px4_backend_init の中身で、r850 および rt710 の init を呼ぶ)
         for chrdev in self.px4chrdev.iter_mut() {
@@ -740,7 +750,8 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
         // もし最後のチャンネルが閉じられたなら、エコモード（電源OFF）に移行する
         if self.open_count == 0 {
-            info!("All tuners closed. Powering off backend hardware...");
+            //info!("All tuners closed. Powering off backend hardware...");
+            info!("All tuners closed.");
 
             // 全チップの論理的な終了処理（フラグクリア等）
             for chrdev in self.px4chrdev.iter_mut() {
@@ -748,7 +759,12 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             }
 
             // 基板全体の電源を落とす
-            self.backend_set_power(false)?;
+            //self.backend_set_power(false)?;
+            // Cコード: if (!px4->mldev && !px4->card_open_count) px4_backend_set_power(px4, false);
+            if !self.use_mldev && self.card_open_count == 0 {
+                info!("No active card session. Powering off backend hardware...");
+                self.backend_set_power(false)?;
+            }
         }
 
         // debug
@@ -954,6 +970,46 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         }
 
         Ok((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000040) != 0)
+    }
+}
+
+// B-CAS Card 関連
+impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
+    /// カード使用開始。必要なら backend 電源を投入する。
+    /// 既存の tuner 用ロジックと同じ self の中で完結させることで、
+    /// 呼び出し元は Arc<Mutex<Px4Device>> の同じロックの中で実行される。
+    pub fn card_acquire(&mut self) -> Result<(), TunerError> {
+        if self.card_open_count == 0 && self.open_count == 0 {
+            self.backend_set_power(true)?;
+        }
+        self.card_open_count += 1;
+        Ok(())
+    }
+
+    pub fn card_release(&mut self) -> Result<(), TunerError> {
+        if self.card_open_count == 0 {
+            return Ok(());
+        }
+        self.card_open_count -= 1;
+        if self.card_open_count == 0 && self.open_count == 0 {
+            self.backend_set_power(false)?;
+        }
+        Ok(())
+    }
+
+    /// BCAS transceive を、tuner操作と同じ排他制御の中で実行する唯一の入口
+    pub fn card_transceive(&mut self, req: &[u8]) -> Result<Vec<u8>, SmartCardError> {
+        let card = self.card.as_mut().ok_or(SmartCardError::CardNotPresent)?;
+        card.transceive_raw(req) // 実体は既存の BcasCard の実装をそのまま使う
+    }
+
+    pub fn card_full_reset(&mut self) -> Result<CardInfo, SmartCardError> {
+        let card = self.card.as_mut().ok_or(SmartCardError::CardNotPresent)?;
+        card.full_reset()
+    }
+    pub fn card_detect(&mut self) -> Result<bool, SmartCardError> {
+        let card = self.card.as_mut().ok_or(SmartCardError::CardNotPresent)?;
+        card.detect()
     }
 }
 

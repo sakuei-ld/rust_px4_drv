@@ -5,6 +5,7 @@
 
 use crate::drivers::it930x::{CtrlMsgError, GpioMode, IT930x};
 use crate::drivers::itedtv_bus::BusOps;
+use ::tracing::warn;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -56,6 +57,8 @@ const T1_RX_TIMEOUT_MS: u64 = 200;
 const T1_RX_POLL_MS: u64 = 10;
 const T1_GUARD_INTERVAL_US: u64 = 0;
 const RX_ZERO_LENGTH_RETRY_MAX: u8 = 3;
+
+const T1_GUARD_INTERVAL_MS: u64 = 10;
 
 /// B-CASカードIDを算出する（bcs-perl.pl の formatCardId と同一アルゴリズム）。
 ///
@@ -184,6 +187,8 @@ pub struct BcasCard<'a, B: BusOps> {
     t1: T1State,
     /// 直近のATR (Answer To Reset)
     pub atr: Vec<u8>,
+    // 前回の通信完了時刻
+    last_io_time: Option<Instant>,
 }
 
 impl<'a, B: BusOps> BcasCard<'a, B> {
@@ -194,6 +199,7 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             current_protocol: Protocol::None,
             t1: T1State::default(),
             atr: Vec::new(),
+            last_io_time: None,
         }
     }
 
@@ -282,10 +288,16 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
 
     /// T=1プロトコルに基づくブロックを送信する
     fn send_t1_block(&mut self, block: &[u8]) -> Result<(), SmartCardError> {
+        // フレーム送信の直前で wait_guard_interval() を呼び出し、送信後に update_io_time() を呼ぶ
+        self.wait_guard_interval();
+
         // ブロックデータをそのままUARTで送信
         self.it930x
             .bcas_send_data(block)
             .map_err(SmartCardError::Control)?;
+
+        self.update_io_time();
+
         Ok(())
     }
 
@@ -357,6 +369,7 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
     ///
     /// TS, TA1, TB1, TC1, TD1, ... とインターフェースバイトを辿り、
     /// T=1用のパラメータ（IFSC、EDC種別）を抽出する。
+    /*
     fn parse_atr(atr: &[u8]) -> Result<CardInfo, SmartCardError> {
         if atr.is_empty() {
             return Err(SmartCardError::InvalidAtr);
@@ -488,22 +501,102 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             edc_crc,
         })
     }
+    */
+
+    /// ATR (Answer To Reset) のパース処理
+    pub fn parse_atr(atr: &[u8]) -> Result<CardInfo, SmartCardError> {
+        if atr.len() < 2 {
+            return Err(SmartCardError::Protocol("ATR too short".to_string()));
+        }
+
+        let ts = atr[0];
+        if ts != 0x3B && ts != 0x3F {
+            return Err(SmartCardError::Protocol(format!(
+                "Invalid TS byte in ATR: 0x{:02X}",
+                ts
+            )));
+        }
+
+        let t0 = atr[1];
+        let mut idx = 2;
+
+        let mut td = t0;
+        let mut generation = 1;
+
+        let mut ifsc: Option<u8> = None; // 明示的な TA3 がない場合は None（またはデフォルト32）
+        let mut edc_crc = false; // デフォルトは LRC
+
+        while (td & 0xF0) != 0 {
+            let presence = (td & 0xF0) >> 4;
+            let has_ta = (presence & 0x01) != 0;
+            let has_tb = (presence & 0x02) != 0;
+            let has_tc = (presence & 0x04) != 0;
+            let has_td = (presence & 0x08) != 0;
+
+            if has_ta {
+                let ta = *atr.get(idx).ok_or_else(|| {
+                    SmartCardError::Protocol(format!("Truncated TA{}", generation))
+                })?;
+                idx += 1;
+
+                if generation == 3 {
+                    ifsc = Some(ta); // TA3 = IFSC
+                }
+            }
+
+            if has_tb {
+                let _tb = *atr.get(idx).ok_or_else(|| {
+                    SmartCardError::Protocol(format!("Truncated TB{}", generation))
+                })?;
+                idx += 1;
+            }
+
+            if has_tc {
+                let tc = *atr.get(idx).ok_or_else(|| {
+                    SmartCardError::Protocol(format!("Truncated TC{}", generation))
+                })?;
+                idx += 1;
+
+                if generation == 3 {
+                    edc_crc = (tc & 0x01) != 0; // TC3 bit0 = EDC (0:LRC, 1:CRC)
+                }
+            }
+
+            if has_td {
+                td = *atr.get(idx).ok_or_else(|| {
+                    SmartCardError::Protocol(format!("Truncated TD{}", generation))
+                })?;
+                idx += 1;
+            } else {
+                break;
+            }
+
+            generation += 1;
+        }
+
+        Ok(CardInfo {
+            atr: atr.to_vec(),
+            ts,
+            t0,
+            protocol: Protocol::T1, // B-CASは T=1 固定
+            ifsc,
+            edc_crc,
+        })
+    }
+
+    /// カードとの通信プロトコルが確立済みかどうか
+    pub fn protocol_ready(&self) -> bool {
+        !matches!(self.current_protocol, Protocol::None)
+    }
 }
 
 impl<'a, B: BusOps> SmartCardInterface for BcasCard<'a, B> {
     /// カードのリセットを実行
     fn reset(&mut self) -> Result<CardInfo, SmartCardError> {
-        // 電力供給有効化
-        self.set_power(true)?;
-
-        // リセットアサート
-        self.set_reset(true)?;
-
-        // デレイ（カードのリセット時間待ち）
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // リリース
-        self.set_reset(false)?;
+        // UART再初期化込みの完全リセットを使う
+        self.it930x
+            .bcas_reset_card()
+            .map_err(SmartCardError::Control)?;
 
         // ATR受信
         let mut atr_buf = [0u8; MAX_ATR_LENGTH];
@@ -546,7 +639,12 @@ impl<'a, B: BusOps> SmartCardInterface for BcasCard<'a, B> {
         }
 
         let card_info = Self::parse_atr(&atr_buf[..offset])?;
+
+        // 取得した CardInfo の情報で内部状態を更新
+        self.t1.ifsc = card_info.ifsc.unwrap_or(32); // TA3指定がなければ規定値 32
+        self.t1.edc_crc = card_info.edc_crc;
         self.current_protocol = card_info.protocol.clone();
+        self.atr = card_info.atr.clone();
 
         // ATRを内部状態に保存（monitor_loop や verify_atr で使用）
         self.atr = atr_buf[..offset].to_vec();
@@ -721,8 +819,13 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             return Err(SmartCardError::Protocol("Empty data".to_string()));
         }
 
+        // フレーム送信の直前で wait_guard_interval() を呼び出し、送信後に update_io_time() を呼ぶ
+        self.wait_guard_interval();
+
         // T=0: コマンドを送信
         self.it930x.bcas_send_data(data)?;
+
+        self.update_io_time();
 
         // レスポンスを受信（簡易実装）
         let mut resp_buf = [0u8; 256];
@@ -747,6 +850,7 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
     /// T=1初期化: RESYNCH + IFSネゴシエーション (px4_ifd_t1_init)
     ///
     /// bcas_reset_card()の直後に呼び出し、通常のI-block通信の前に実行する。
+    //*
     pub fn t1_init(&mut self) -> Result<(), SmartCardError> {
         const MAX_RETRIES: u8 = 3;
 
@@ -761,11 +865,21 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
                     "Frame buffer too small".to_string(),
                 ));
             }
+
+            // フレーム送信の直前で wait_guard_interval() を呼び出し、送信後に update_io_time() を呼ぶ
+            self.wait_guard_interval();
+
             self.it930x.bcas_send_data(&frame_buf[..len])?;
+
+            self.update_io_time();
 
             // Wait for RESYNCH response from ICC
             let mut resp = [0u8; 256];
-            if !self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)? {
+            //if !self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)? {
+            //    continue;
+            //}
+            let recv_len = self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)?;
+            if recv_len == 0 {
                 continue;
             }
 
@@ -789,10 +903,20 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
                     "Frame buffer too small".to_string(),
                 ));
             }
+
+            // フレーム送信の直前で wait_guard_interval() を呼び出し、送信後に update_io_time() を呼ぶ
+            self.wait_guard_interval();
+
             self.it930x.bcas_send_data(&frame_buf[..len])?;
 
+            self.update_io_time();
+
             let mut resp = [0u8; 256];
-            if !self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)? {
+            //if !self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)? {
+            //    continue;
+            //}
+            let recv_len = self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)?;
+            if recv_len == 0 {
                 continue;
             }
 
@@ -812,8 +936,9 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             "T=1 init failed: RESYNCH/IFS negotiation timeout".to_string(),
         ))
     }
-
+    //*/
     /// T=1プロトコルでAPDUを送信・受信する (px4_ifd_t1_transmit)
+    /*
     fn transceive_t1(&mut self, data: &[u8]) -> Result<Vec<u8>, SmartCardError> {
         if data.is_empty() {
             return Err(SmartCardError::Protocol("Empty data".to_string()));
@@ -855,7 +980,11 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             if pcb & T1_PCB_I_CHAIN != 0 {
                 // Wait for R-block ACK
                 let mut resp = [0u8; 256];
-                if !self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)? {
+                //if !self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)? {
+                //    return Err(SmartCardError::Timeout);
+                //}
+                let recv_len = self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)?;
+                if recv_len == 0 {
                     return Err(SmartCardError::Timeout);
                 }
 
@@ -878,8 +1007,7 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             // --- ICC → IFD: Receive I/R/S-block ---
             let mut resp = [0u8; 256];
             let recv_len = match self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS) {
-                Ok(true) => resp.len(),
-                Ok(false) | Err(SmartCardError::Timeout) => {
+                Ok(0) | Err(SmartCardError::Timeout) => {
                     // Zero-length response retry logic (per ifdhandler.c)
                     zero_len_retry += 1;
                     if zero_len_retry < RX_ZERO_LENGTH_RETRY_MAX {
@@ -887,6 +1015,7 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
                     }
                     return Err(SmartCardError::Timeout);
                 }
+                Ok(n) => n,
                 Err(e) => return Err(e),
             };
 
@@ -977,19 +1106,175 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
 
         Ok(inf_buf)
     }
+    */
+    fn transceive_t1(&mut self, data: &[u8]) -> Result<Vec<u8>, SmartCardError> {
+        if data.is_empty() {
+            return Err(SmartCardError::Protocol("Empty data".to_string()));
+        }
+
+        let mut inf_buf = Vec::new();
+        let mut offset: usize = 0;
+        let mut zero_len_retry: u8 = 0;
+
+        // --- 1. 送信フェーズ (IFD -> ICC) ---
+        while offset < data.len() {
+            let remaining = data.len() - offset;
+            // 固定値 MAX_BLOCK_SIZE ではなく self.t1.ifsc を使用する
+            let block_len = std::cmp::min(remaining, self.t1.ifsc as usize);
+            let chunk = &data[offset..offset + block_len];
+
+            // 送信後にまだ残りのデータがあれば連鎖 (M bit = 1)
+            let is_chained = (offset + block_len) < data.len();
+
+            let mut pcb: u8 = T1_PCB_I_BLOCK | (self.t1.seq << 6);
+            if is_chained {
+                pcb |= T1_PCB_I_CHAIN;
+            }
+
+            let mut frame_buf = [0u8; 256];
+            let frame_len = Self::make_t1_frame(&mut frame_buf, pcb, chunk, self.t1.edc_crc);
+            if frame_len == 0 {
+                return Err(SmartCardError::Protocol(
+                    "Frame buffer too small".to_string(),
+                ));
+            }
+
+            // フレーム送信の直前で wait_guard_interval() を呼び出し、送信後に update_io_time() を呼ぶ
+            self.wait_guard_interval();
+
+            self.it930x.bcas_send_data(&frame_buf[..frame_len])?;
+
+            self.update_io_time();
+
+            offset += block_len;
+            // I-block送信ごとに自身のseqを反転
+            self.t1.seq ^= 1;
+
+            // 連鎖送信(M=1)の場合は、カードからの R-block ACK を待つ
+            if is_chained {
+                let mut resp = [0u8; 256];
+                let recv_len = self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)?;
+                if recv_len < 3 || (resp[1] & 0xC0) != T1_PCB_R_BLOCK {
+                    return Err(SmartCardError::Protocol("Expected R-block ACK".to_string()));
+                }
+                // R-blockの要求seqに更新
+                self.t1.seq = (resp[1] & T1_PCB_R_SEQ) >> 4;
+            }
+        }
+
+        // --- 2. 受信フェーズ (ICC -> IFD) ---
+        loop {
+            let mut resp = [0u8; 256];
+            let recv_len = match self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS) {
+                Ok(0) | Err(SmartCardError::Timeout) => {
+                    zero_len_retry += 1;
+                    if zero_len_retry < RX_ZERO_LENGTH_RETRY_MAX {
+                        continue;
+                    }
+                    return Err(SmartCardError::Timeout);
+                }
+                Ok(n) => n,
+                Err(e) => return Err(e),
+            };
+
+            zero_len_retry = 0;
+
+            if recv_len < 3 || resp[0] != T1_NAD_IFD_ICC {
+                return Err(SmartCardError::Protocol(
+                    "Invalid response frame".to_string(),
+                ));
+            }
+
+            let pcb_resp = resp[1];
+            if (pcb_resp & 0x80) != 0 {
+                return Err(SmartCardError::Protocol(format!(
+                    "Expected I-block, got PCB: 0x{:02X}",
+                    pcb_resp
+                )));
+            }
+
+            let inf_len = resp[2] as usize;
+            let edc_len = if self.t1.edc_crc { 2 } else { 1 };
+            if recv_len < 3 + inf_len + edc_len {
+                return Err(SmartCardError::Protocol(
+                    "Frame length mismatch".to_string(),
+                ));
+            }
+
+            // EDC (CRC/LRC) のチェック
+            let edc_start = 3 + inf_len;
+            if self.t1.edc_crc {
+                let expected_crc = Self::t1_crc(&resp[..edc_start]);
+                let actual_crc = ((resp[edc_start] as u16) << 8) | (resp[edc_start + 1] as u16);
+                if expected_crc != actual_crc {
+                    return Err(SmartCardError::Protocol("CRC mismatch".to_string()));
+                }
+            } else {
+                let expected_lrc = Self::t1_lrc(&resp[..edc_start]);
+                if resp[edc_start] != expected_lrc {
+                    return Err(SmartCardError::Protocol("LRC mismatch".to_string()));
+                }
+            }
+
+            inf_buf.extend_from_slice(&resp[3..3 + inf_len]);
+
+            // カードからの連鎖フラグ(M bit)を確認
+            let has_chain = (pcb_resp & T1_PCB_I_CHAIN) != 0;
+            if !has_chain {
+                break; // 最終ブロックを受信完了
+            }
+
+            // カード側が次のブロックを持っていれば、R-block ACK を返す
+            let card_seq = if (pcb_resp & T1_PCB_I_SEQ) != 0 { 1 } else { 0 };
+            let next_expected_seq = 1 - card_seq; // カードに要求する次のseq
+            let r_pcb = T1_PCB_R_BLOCK | T1_PCB_R_NO_ERROR | (next_expected_seq << 4);
+
+            let mut r_frame = [0u8; 256];
+            let r_len = Self::make_t1_frame(&mut r_frame, r_pcb, &[], self.t1.edc_crc);
+
+            // フレーム送信の直前で wait_guard_interval() を呼び出し、送信後に update_io_time() を呼ぶ
+            self.wait_guard_interval();
+
+            self.it930x.bcas_send_data(&r_frame[..r_len])?;
+
+            self.update_io_time();
+        }
+
+        Ok(inf_buf)
+    }
 
     /// Wait for a response frame from the card (non-blocking poll)
-    fn t1_wait_response(&self, buf: &mut [u8], timeout_ms: u64) -> Result<bool, SmartCardError> {
+    fn t1_wait_response(&self, buf: &mut [u8], timeout_ms: u64) -> Result<usize, SmartCardError> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut total = 0usize;
+
         loop {
-            if self.it930x.bcas_check_ready().unwrap_or(false) {
-                let len = self.it930x.bcas_get_data(buf)?;
-                if len > 0 {
-                    return Ok(true);
+            //if self.it930x.bcas_check_ready().unwrap_or(false) {
+            if self.it930x.bcas_check_ready().unwrap_or_else(|e| {
+                warn!("check_ready error: {e}");
+                false
+            }) {
+                let n = self.it930x.bcas_get_data(&mut buf[total..])?;
+                total += n;
+
+                // NAD+PCB+LENの3バイトが揃って初めてフレーム全長が分かる
+                if total >= 3 {
+                    let inf_len = buf[2] as usize;
+                    let edc_len = if self.t1.edc_crc { 2 } else { 1 };
+                    let frame_total = 3 + inf_len + edc_len;
+
+                    if total >= frame_total {
+                        // 完全なフレームが揃ったら終了
+                        return Ok(frame_total);
+                    }
+                    // 全部届いていない場合はポーリング継続
                 }
             }
             if Instant::now() >= deadline {
-                return Ok(false);
+                // タイムアウトの場合
+                // 0 or 中途半端なバイト数 を返す
+                // 0 に落としても良いかも
+                return Ok(total);
             }
             std::thread::sleep(Duration::from_millis(T1_RX_POLL_MS));
         }
@@ -1065,6 +1350,47 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
         self.it930x.bcas_init()?;
         self.it930x.bcas_reset_card()?;
         Ok(())
+    }
+
+    /// カードの完全な初期化・再初期化を行う。
+    /// ハードウェアリセット → ATR受信・パース → (T=1の場合) RESYNCH+IFSネゴシエーション、
+    /// までを一括で行う。通常はこのメソッドだけを呼べばよい。
+    pub fn full_reset(&mut self) -> Result<CardInfo, SmartCardError> {
+        let card_info = self.reset()?; // HWリセット + ATR受信 + current_protocol確定
+
+        if card_info.protocol == Protocol::T1 {
+            // ATRから解析したT=1パラメータをセッション状態へ反映する
+            self.t1.ifsc = card_info.ifsc.unwrap_or(DEFAULT_T1_IFSC);
+            self.t1.edc_crc = card_info.edc_crc;
+            self.t1.seq = 0;
+
+            // ATR受信後、19200bpsへ切り替える
+            // (ifdhander.c の IFDHPowerICC と同じ手順)
+            self.it930x
+                .bcas_set_baudrate(crate::drivers::it930x::UartBaudrate::Baudrate19200)
+                .map_err(SmartCardError::Control)?;
+
+            self.t1_init()?; // RESYNCH + IFSネゴシエーション
+        }
+
+        Ok(card_info)
+    }
+
+    /// 直前の通信から十分なガードタイムが経過しているか確認し、必要ならウェイトを入れる
+    fn wait_guard_interval(&mut self) {
+        if let Some(last_time) = self.last_io_time {
+            let elapsed = last_time.elapsed();
+            let guard_duration = Duration::from_millis(T1_GUARD_INTERVAL_MS);
+
+            if elapsed < guard_duration {
+                std::thread::sleep(guard_duration - elapsed);
+            }
+        }
+    }
+
+    /// 通信成功時にタイムスタンプを更新する
+    fn update_io_time(&mut self) {
+        self.last_io_time = Some(Instant::now());
     }
 }
 
