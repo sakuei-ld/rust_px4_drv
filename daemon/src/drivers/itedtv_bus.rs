@@ -59,6 +59,12 @@ pub struct UsbBusRusb {
 
     consumer_thread: Mutex<Option<thread::JoinHandle<()>>>,
     producer_thread: Mutex<Option<thread::JoinHandle<()>>>,
+
+    // Drop 調査用
+    // このデバイスインスタンス固有の ctrl bus (0x02/0x81) 使用量計測。
+    // it930x側ではなくここで数えることで、複数IT930xチップ構成でも混線しない。
+    ctrl_msg_count: Arc<std::sync::atomic::AtomicU64>,
+    ctrl_msg_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl UsbBusRusb {
@@ -162,6 +168,10 @@ impl UsbBusRusb {
             stop_flag: Arc::new(AtomicBool::new(false)),
             consumer_thread: Mutex::new(None),
             producer_thread: Mutex::new(None),
+
+            // Drop 調査用
+            ctrl_msg_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ctrl_msg_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 }
@@ -169,10 +179,16 @@ impl UsbBusRusb {
 impl BusOps for UsbBusRusb {
     // itedtv_bus.c の 47〜70 と思われる。
     fn ctrl_tx(&self, buf: &[u8]) -> Result<(), BusError> {
-        //let guarded_handle = self.handle.lock().unwrap();
-        //guarded_handle.write_bulk(self.ctrl_tx_ep, buf, self.ctrl_timeout)?;
         self.handle
             .write_bulk(self.ctrl_tx_ep, buf, self.ctrl_timeout)?;
+
+        // Drop 調査用
+        // 実際に送信した全バイト数(ヘッダ+checksum込み)をそのまま計上。
+        // 呼び出し回数は tx 側でのみ+1する(1回のctrl_msg呼び出し = tx1回+rx1回のペアなので、
+        // "msgs" は tx 側だけでカウントすれば二重にならない)。
+        self.ctrl_msg_count.fetch_add(1, Ordering::Relaxed);
+        self.ctrl_msg_bytes
+            .fetch_add(buf.len() as u64, Ordering::Relaxed);
 
         thread::sleep(Duration::from_millis(1));
         Ok(())
@@ -183,6 +199,11 @@ impl BusOps for UsbBusRusb {
         let read_len = self
             .handle
             .read_bulk(self.ctrl_rx_ep, buf, self.ctrl_timeout)?;
+
+        // Drop 調査用
+        // RX側も実際に読めたバイト数を計上(以前は完全に漏れていた分)
+        self.ctrl_msg_bytes
+            .fetch_add(read_len as u64, Ordering::Relaxed);
 
         thread::sleep(Duration::from_millis(1));
         Ok(read_len)
@@ -254,6 +275,11 @@ impl BusOps for UsbBusRusb {
         let internal_drop_consumer = internal_drop_counter.clone();
         let internal_drop_producer = internal_drop_counter.clone();
 
+        // Drop 調査用
+        // ctrl busの統計もコンシューマスレッドで一緒に読めるようにclone
+        let ctrl_msg_count = self.ctrl_msg_count.clone();
+        let ctrl_msg_bytes = self.ctrl_msg_bytes.clone();
+
         // Consumer スレッド (パースと分配の専任)
         let consumer_handle = thread::spawn(move || {
             // ここで span を生成すると、スレッド内の処理が「どのコンテキストか」明確になる
@@ -271,44 +297,58 @@ impl BusOps for UsbBusRusb {
                 total_packet_count_consumer.fetch_add(1, Ordering::Relaxed);
                 total_byte_count_consumer.fetch_add(data.len() as u64, Ordering::Relaxed);
 
-                if last_log.elapsed() >= Duration::from_secs(5) {
-                    let packets = packet_count_consumer.swap(0, Ordering::Relaxed);
-                    let bytes = byte_count_consumer.swap(0, Ordering::Relaxed);
+                let elapsed = last_log.elapsed();
+                if elapsed >= Duration::from_secs(5) {
+                    // Drop 調査用
+                    // 固定値(5.0)ではなく実測値を使う
+                    let elapsed_secs = elapsed.as_secs_f64();
+
+                    let usb_reads = packet_count_consumer.swap(0, Ordering::Relaxed);
+                    let usb_bytes = byte_count_consumer.swap(0, Ordering::Relaxed);
                     let drops = internal_drop_consumer.swap(0, Ordering::Relaxed);
+                    let ctrl_msgs = ctrl_msg_count.swap(0, Ordering::Relaxed);
+                    let ctrl_bytes = ctrl_msg_bytes.swap(0, Ordering::Relaxed);
 
+                    // "packets" ではなく "reads"(USBバルク読み取り回数)であることを明示
                     info!(
-                        "consumer rate: packets={} bytes={} ({:.2} MiB/s)",
-                        packets,
-                        bytes,
-                        bytes as f64 / 1024.0 / 1024.0 / 5.0
+                        "usb bulk in: reads={} bytes={} rate={:.2}MiB/s (interval={:.3}s)",
+                        usb_reads,
+                        usb_bytes,
+                        usb_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs,
+                        elapsed_secs
                     );
-
-                    let (ctrl_count, ctrl_bytes) = crate::drivers::it930x::take_ctrl_stats(); // 型パラメータの都合は要調整
-                    info!("ctrl bus: msgs={} bytes={} (last 5s)", ctrl_count, ctrl_bytes);
 
                     if drops > 0 {
                         warn!(
-                            "{} USB packets dropped in the last 5 secs (parser thread too slow.)",
+                            "{} USB reads dropped in the last interval (parser thread too slow)",
                             drops
                         );
                     }
 
-                    info!("remain packet: {}", raw_rx.len());
+                    info!("raw_rx queue depth: {}", raw_rx.len());
+                    info!(
+                        "ctrl bus: msgs={} bytes={} (interval={:.3}s)",
+                        ctrl_msgs, ctrl_bytes, elapsed_secs
+                    );
 
                     last_log = std::time::Instant::now();
                 }
 
                 // panic をキャッチしてログに出す
-                if let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handler(&data);
-                })) {
+                }))
+                .is_err()
+                {
                     // パニックしたらスレッドを終了させる
                     error!("Handler panicked! Thread will terminate.");
                     break;
                 }
             }
+
+            // debug
             info!(
-                "consumer total packets={} bytes={}",
+                "consumer total: usb_reads={} bytes={}",
                 total_packet_count_consumer.load(Ordering::Relaxed),
                 total_byte_count_consumer.load(Ordering::Relaxed)
             );

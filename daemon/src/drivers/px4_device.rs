@@ -2,7 +2,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use tracing::{error, info, warn};
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::drivers::it930x::{CtrlMsgError, GpioMode, IT930x, PidFilter};
@@ -222,29 +222,41 @@ struct TargetPort {
     tx: Sender<Bytes>,
     // ポートごとの一括送信用バッファ
     buffer: BytesMut,
-    // debug
-    sent_batches: u64,
-    sent_bytes: u64,
 
-    // debug用
-    dropped_batches: u64, // 追加
+    // Drop 調査用
+    // 直近5秒の区間集計（5秒ごとにログ出力してリセット）
+    interval_sent_batches: u64,
+    interval_sent_bytes: u64,
+    interval_dropped_batches: u64,
+
+    // Drop 調査用
+    // セッション全体の累積（ストリーム終了時のサマリ用、リセットしない）
+    total_sent_batches: u64,
+    total_sent_bytes: u64,
+    total_dropped_batches: u64,
 }
-
-// debug
-static DISPATCH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // ストリーム処理部分
 struct Px4StreamContext {
     pub targets: Vec<TargetPort>,
     // バッチ送信用のアロケーション使い回しバッファ
     pub stream_buffer: BytesMut,
-    // debug
-    dispatch_bytes: u64,
-    dispatch_batches: u64,
-    debug_last_log: std::time::Instant,
 
-    // debug用
-    resync_count: u64,           // 追加
+    // Drop 調査用
+    interval_dispatch_batches: u64,
+    interval_dispatch_bytes: u64,
+    interval_resync_events: u64,
+    interval_resync_skipped_bytes: u64, // 追加: resyncで捨てたバイト数
+
+    // Drop 調査用
+    total_dispatch_batches: u64,
+    total_dispatch_bytes: u64,
+    total_resync_events: u64,
+    total_resync_skipped_bytes: u64,
+
+    // Drop 調査用
+    debug_last_log: std::time::Instant,
+    cleanly_stopped: bool,
 }
 
 impl Px4StreamContext {
@@ -255,10 +267,13 @@ impl Px4StreamContext {
                 port_number: c.port_number,
                 tx: c.tx.clone(),
                 buffer: BytesMut::with_capacity(32 * 1024),
-                sent_batches: 0, // debug
-                sent_bytes: 0,
-                // debug用
-                dropped_batches: 0,
+                // Drop 調査用
+                interval_sent_batches: 0,
+                interval_sent_bytes: 0,
+                interval_dropped_batches: 0,
+                total_sent_batches: 0,
+                total_sent_bytes: 0,
+                total_dropped_batches: 0,
             })
             .collect();
 
@@ -266,11 +281,17 @@ impl Px4StreamContext {
             targets,
             // 64KB分を事前に確保。以降、キャパシティを超えない限りアロケーションは発生しない
             stream_buffer: BytesMut::with_capacity(64 * 1024),
-            dispatch_bytes: 0,
-            dispatch_batches: 0,
+            // Drop 調査用
+            interval_dispatch_batches: 0,
+            interval_dispatch_bytes: 0,
+            interval_resync_events: 0,
+            interval_resync_skipped_bytes: 0,
+            total_dispatch_batches: 0,
+            total_dispatch_bytes: 0,
+            total_resync_events: 0,
+            total_resync_skipped_bytes: 0,
             debug_last_log: std::time::Instant::now(),
-
-            resync_count: 0,
+            cleanly_stopped: false,
         }
     }
 
@@ -296,10 +317,10 @@ impl Px4StreamContext {
             }
 
             if !is_synced {
-                offset += 1;
+                // Drop 調査用
+                let resync_start = offset;
 
-                // debug
-                self.resync_count += 1; // 追加
+                offset += 1;
 
                 // 試行中
                 // 同期が崩れた場合の高速スキャン
@@ -309,6 +330,16 @@ impl Px4StreamContext {
                     }
                     offset += 1;
                 }
+
+                // Drop 調査用
+                // 1回の「同期崩れ→再走査」を1イベントとして記録。
+                // 偽陽性の候補バイトに当たった場合、同じ破損箇所で複数回加算されうる点に注意。
+                let skipped = (offset - resync_start) as u64;
+                self.interval_resync_events += 1;
+                self.interval_resync_skipped_bytes += skipped;
+                self.total_resync_events += 1;
+                self.total_resync_skipped_bytes += skipped;
+
                 continue;
             }
 
@@ -323,7 +354,7 @@ impl Px4StreamContext {
                     self.stream_buffer[offset] = 0x47;
                     let packet = &self.stream_buffer[offset..offset + 188];
 
-                    // 【最適化】クロージャの find をやめ、単純なループで比較 (O(N)の高速化)
+                    // [最適化] クロージャの find をやめ、単純なループで比較 (O(N)の高速化)
                     for t in &mut self.targets {
                         if t.port_number == id {
                             t.buffer.extend_from_slice(packet);
@@ -351,42 +382,108 @@ impl Px4StreamContext {
                 // try_send() で、受信側が詰まっていても USB受信スレッドをブロックさせない
                 match t.tx.try_send(batch) {
                     Ok(_) => {
-                        // debug
-                        t.sent_batches += 1;
-                        t.sent_bytes += batch_len as u64;
-                        self.dispatch_batches += 1;
-                        self.dispatch_bytes += batch_len as u64;
+                        // Drop 調査用
+                        t.interval_sent_batches += 1;
+                        t.interval_sent_bytes += batch_len as u64;
+                        t.total_sent_batches += 1;
+                        t.total_sent_bytes += batch_len as u64;
+
+                        // Drop 調査用
+                        self.interval_dispatch_batches += 1;
+                        self.interval_dispatch_bytes += batch_len as u64;
+                        self.total_dispatch_batches += 1;
+                        self.total_dispatch_bytes += batch_len as u64;
                     }
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
-                        t.dropped_batches += 1; // 追加
+                        // Drop 調査用
+                        t.interval_dropped_batches += 1;
+                        t.total_dropped_batches += 1;
+
                         error!(
-                            "[Warning] Port {} channel full. Dropped batch.",
-                            t.port_number
+                            "[Warning] Port {} channel full. Dropped batch ({} bytes).",
+                            t.port_number, batch_len
                         );
                     }
                     Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                         error!("Port {} receiver disconnected", t.port_number);
                     }
                 }
-
-                DISPATCH_BYTES.fetch_add(batch_len as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
-        if self.debug_last_log.elapsed() >= Duration::from_secs(5) {
+        let elapsed = self.debug_last_log.elapsed();
+        if elapsed >= Duration::from_secs(5) {
+            // Drop 調査用
+            // dispatch_bytes は「配送できたTSペイロード量」であり、USB受信量とは別指標である点に注意。
+            // ロス判定には使わず、resync_events / dropped_batches / itedtv_bus側の internal_drop を見ること。
             info!(
-                "dispatch batches={} bytes={} resync_events={}",
-                self.dispatch_batches, self.dispatch_bytes, self.resync_count
+                "dispatch: batches={} bytes={} resync_events={} resync_skipped_bytes={} (interval={:.3}s)",
+                self.interval_dispatch_batches,
+                self.interval_dispatch_bytes,
+                self.interval_resync_events,
+                self.interval_resync_skipped_bytes,
+                elapsed.as_secs_f64()
             );
 
             for t in &self.targets {
-                if t.dropped_batches > 0 {
-                    warn!("port {} dropped_batches={} (channel full)", t.port_number, t.dropped_batches);
+                if t.interval_dropped_batches > 0 {
+                    warn!(
+                        "port {} dropped_batches={} in the last interval (channel full)",
+                        t.port_number, t.interval_dropped_batches
+                    );
                 }
+            }
+
+            self.interval_dispatch_batches = 0;
+            self.interval_dispatch_bytes = 0;
+            self.interval_resync_events = 0;
+            self.interval_resync_skipped_bytes = 0;
+            for t in &mut self.targets {
+                t.interval_sent_batches = 0;
+                t.interval_sent_bytes = 0;
+                t.interval_dropped_batches = 0;
             }
 
             self.debug_last_log = std::time::Instant::now();
         }
+    }
+
+    // Drop 調査用
+    /// stop_capture() からのみ呼ぶ。ログ出力はしない。
+    pub fn mark_cleanly_stopped(&mut self) {
+        self.cleanly_stopped = true;
+    }
+
+    // Drop 調査用
+    /// ストリーム終了時にセッション全体のサマリを1回だけ出力する。
+    /// itedtv_bus 側の stop_streaming() が join を終えた直後、
+    /// Px4StreamContext を破棄する前に呼ぶこと。
+    pub fn log_summary(&self) {
+        info!(
+            "stream summary: dispatch_batches={} dispatch_bytes={} resync_events={} resync_skipped_bytes={}",
+            self.total_dispatch_batches,
+            self.total_dispatch_bytes,
+            self.total_resync_events,
+            self.total_resync_skipped_bytes,
+        );
+        for t in &self.targets {
+            info!(
+                "  port {}: sent_batches={} sent_bytes={} dropped_batches={}",
+                t.port_number, t.total_sent_batches, t.total_sent_bytes, t.total_dropped_batches
+            );
+        }
+    }
+}
+
+impl Drop for Px4StreamContext {
+    fn drop(&mut self) {
+        if !self.cleanly_stopped {
+            warn!(
+                "Px4StreamContext dropped without going through stop_capture() \
+                 (thread panic or abnormal shutdown?)"
+            );
+        }
+        self.log_summary();
     }
 }
 
@@ -441,8 +538,15 @@ pub struct Px4Device<'a, B: BusOps + Sync> {
     // PX-Q3U4 かつ multi device として使う場合に true をセットする。
     use_mldev: bool,
 
+    // B-CAS カードリーダー用
     card: Option<BcasCard<'a, B>>,
     card_open_count: usize,
+
+    // Drop 調査用
+    // 現在進行中のストリームの統計情報への共有ハンドル。
+    // 注意: この Arc のクローンは「配送クロージャ側」と「Px4Device側」の2つに限定すること。
+    // 参照を増やすと Drop (=stream summary ログ) のタイミングが不定になる。
+    stream_ctx: Option<Arc<Mutex<Px4StreamContext>>>,
 }
 
 impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
@@ -559,7 +663,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
                 system: config.system,
                 port_number: i as u8 + 1,
                 tx,
-                tuner: tuner,
+                tuner,
                 is_opened: false,
                 is_streaming: false,
                 lnb_power: false,
@@ -572,9 +676,11 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             open_count: 0,
             lnb_power_count: 0,
             streaming_count: 0,
-            use_mldev: use_mldev,
+            use_mldev,
             card: Some(BcasCard::new(&it930x)),
             card_open_count: 0,
+            // Drop 調査用
+            stream_ctx: None,
         };
 
         Ok((device, receivers))
@@ -861,6 +967,14 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         // 誰もストリーミングしていないなら、ブリッジ全体を停止
         if self.streaming_count == 0 {
             self.it930x.stop_streaming()?;
+
+            if let Some(ctx) = self.stream_ctx.take() {
+                if let Ok(mut guard) = ctx.lock() {
+                    guard.mark_cleanly_stopped();
+                }
+                // ctx (Arcの最後の1つ) がここでスコープを抜けて drop される
+                // → Px4StreamContext::drop() が自動発火 → log_summary() が走る
+            }
         }
 
         // チューナー固有のTS出力ピンを無効化
@@ -1006,7 +1120,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             self.backend_set_power(true)?;
         }
         self.card_open_count += 1;
-        
+
         // true: このセッションは新規（電源がOFFから復帰した可能性、
         //       または前回のクライアントのT=1状態が古い可能性があるため
         //       呼び出し元は full_reset() を挟むべき
@@ -1052,11 +1166,5 @@ impl<'a, B: BusOps + Sync> Drop for Px4Device<'a, B> {
         if self.open_count > 0 {
             let _ = self.backend_set_power(false);
         }
-
-        // debug
-        info!(
-            "dispatch bytes={}",
-            DISPATCH_BYTES.load(std::sync::atomic::Ordering::Relaxed)
-        );
     }
 }

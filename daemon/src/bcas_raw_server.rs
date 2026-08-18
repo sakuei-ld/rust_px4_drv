@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
 use crate::drivers::itedtv_bus::BusOps;
-use crate::drivers::px4_card::{BcasCard, SmartCardError, SmartCardInterface};
+use crate::drivers::px4_card::SmartCardError;
 use crate::drivers::px4_device::Px4Device;
 use crate::error::{DaemonError, DaemonResult};
 use crate::server::SHUTDOWN;
@@ -58,7 +58,7 @@ pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(device: Arc<Mutex<Px4Devic
             continue;
         }
 
-        // debug
+        // Drop 調査用(BCAS処理時間の計測)
         let detect_start = std::time::Instant::now();
 
         // カードが検出されているか確認
@@ -78,6 +78,7 @@ pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(device: Arc<Mutex<Px4Devic
             }
         }
 
+        // Drop 調査用(BCAS処理時間の計測)
         let detect_ms = detect_start.elapsed().as_millis();
         if detect_ms > 50 {
             tracing::warn!("card_detect slow: {}ms", detect_ms);
@@ -173,7 +174,7 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
         let res = {
             let mut attempt = 0;
             loop {
-                // debug
+                // Drop 調査用(BCAS処理時間の計測)
                 let lock_wait_start = std::time::Instant::now();
 
                 let mut dev = match device.lock() {
@@ -184,8 +185,10 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
                     }
                 };
 
+                // Drop 調査用(BCAS処理時間の計測)
                 let lock_wait_ms = lock_wait_start.elapsed().as_millis();
 
+                // Drop 調査用(BCAS処理時間の計測)
                 let xfer_start = std::time::Instant::now();
 
                 // Px4Device 側の card_transceive を呼び出す
