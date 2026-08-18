@@ -593,6 +593,9 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
 impl<'a, B: BusOps> SmartCardInterface for BcasCard<'a, B> {
     /// カードのリセットを実行
     fn reset(&mut self) -> Result<CardInfo, SmartCardError> {
+        // UARTをスマートカードモードに切り替える(従来 initialize() 経由でしか呼ばれていなかった)
+        self.it930x.bcas_init().map_err(SmartCardError::Control)?;
+
         // UART再初期化込みの完全リセットを使う
         self.it930x
             .bcas_reset_card()
@@ -879,12 +882,16 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             //    continue;
             //}
             let recv_len = self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)?;
+
+            // debug
+            tracing::debug!("[bcas] t1_init RESYNCH resp ({} bytes): {:02X?}", recv_len, &resp[..recv_len]);
+
             if recv_len == 0 {
                 continue;
             }
 
             // Parse response
-            if resp[0] == T1_NAD_IFD_ICC && (resp[1] & 0xFC) == T1_PCB_S_RESYNCH_RSP {
+            if resp[0] == T1_NAD_IFD_ICC && resp[1] == T1_PCB_S_RESYNCH_RSP {
                 // Valid RESYNCH response received
                 break;
             }
@@ -916,12 +923,16 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             //    continue;
             //}
             let recv_len = self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)?;
+
+            //debug
+            tracing::debug!("[bcas] t1_init IFS resp ({} bytes): {:02X?}", recv_len, &resp[..recv_len.min(resp.len())]);
+
             if recv_len == 0 {
                 continue;
             }
 
             // Check for S-block IFS response
-            if resp[0] == T1_NAD_IFD_ICC && (resp[1] & 0xFC) == T1_PCB_S_IFS_RSP {
+            if resp[0] == T1_NAD_IFD_ICC && resp[1] == T1_PCB_S_IFS_RSP {
                 // IFSD from card is in INF (index 3)
                 if resp.len() > 3 {
                     // Card accepted our IFS request; we don't necessarily adopt their IFSD,
@@ -1248,7 +1259,13 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut total = 0usize;
 
+        // debug
+        let mut poll_count = 0u32; // 追加
+
         loop {
+            // debug
+            poll_count += 1; // 追加
+
             //if self.it930x.bcas_check_ready().unwrap_or(false) {
             if self.it930x.bcas_check_ready().unwrap_or_else(|e| {
                 warn!("check_ready error: {e}");
@@ -1274,6 +1291,11 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
                 // タイムアウトの場合
                 // 0 or 中途半端なバイト数 を返す
                 // 0 に落としても良いかも
+                // debug
+                if poll_count > 5 {
+                    warn!("t1_wait_response: {} polls before timeout/response", poll_count);
+                }
+
                 return Ok(total);
             }
             std::thread::sleep(Duration::from_millis(T1_RX_POLL_MS));

@@ -225,6 +225,9 @@ struct TargetPort {
     // debug
     sent_batches: u64,
     sent_bytes: u64,
+
+    // debug用
+    dropped_batches: u64, // 追加
 }
 
 // debug
@@ -239,6 +242,9 @@ struct Px4StreamContext {
     dispatch_bytes: u64,
     dispatch_batches: u64,
     debug_last_log: std::time::Instant,
+
+    // debug用
+    resync_count: u64,           // 追加
 }
 
 impl Px4StreamContext {
@@ -251,6 +257,8 @@ impl Px4StreamContext {
                 buffer: BytesMut::with_capacity(32 * 1024),
                 sent_batches: 0, // debug
                 sent_bytes: 0,
+                // debug用
+                dropped_batches: 0,
             })
             .collect();
 
@@ -261,6 +269,8 @@ impl Px4StreamContext {
             dispatch_bytes: 0,
             dispatch_batches: 0,
             debug_last_log: std::time::Instant::now(),
+
+            resync_count: 0,
         }
     }
 
@@ -287,6 +297,9 @@ impl Px4StreamContext {
 
             if !is_synced {
                 offset += 1;
+
+                // debug
+                self.resync_count += 1; // 追加
 
                 // 試行中
                 // 同期が崩れた場合の高速スキャン
@@ -345,6 +358,7 @@ impl Px4StreamContext {
                         self.dispatch_bytes += batch_len as u64;
                     }
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        t.dropped_batches += 1; // 追加
                         error!(
                             "[Warning] Port {} channel full. Dropped batch.",
                             t.port_number
@@ -361,9 +375,16 @@ impl Px4StreamContext {
 
         if self.debug_last_log.elapsed() >= Duration::from_secs(5) {
             info!(
-                "dispatch batches={} bytes={}",
-                self.dispatch_batches, self.dispatch_bytes
+                "dispatch batches={} bytes={} resync_events={}",
+                self.dispatch_batches, self.dispatch_bytes, self.resync_count
             );
+
+            for t in &self.targets {
+                if t.dropped_batches > 0 {
+                    warn!("port {} dropped_batches={} (channel full)", t.port_number, t.dropped_batches);
+                }
+            }
+
             self.debug_last_log = std::time::Instant::now();
         }
     }
@@ -978,12 +999,23 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     /// カード使用開始。必要なら backend 電源を投入する。
     /// 既存の tuner 用ロジックと同じ self の中で完結させることで、
     /// 呼び出し元は Arc<Mutex<Px4Device>> の同じロックの中で実行される。
-    pub fn card_acquire(&mut self) -> Result<(), TunerError> {
-        if self.card_open_count == 0 && self.open_count == 0 {
+    pub fn card_acquire(&mut self) -> Result<bool, TunerError> {
+        let was_card_idle = self.card_open_count == 0;
+
+        if was_card_idle && self.open_count == 0 {
             self.backend_set_power(true)?;
         }
         self.card_open_count += 1;
-        Ok(())
+        
+        // true: このセッションは新規（電源がOFFから復帰した可能性、
+        //       または前回のクライアントのT=1状態が古い可能性があるため
+        //       呼び出し元は full_reset() を挟むべき
+        Ok(was_card_idle)
+    }
+
+    // card_open_count を外部から参照できるようにしておく（修正案2でも使う）
+    pub fn card_in_use(&self) -> bool {
+        self.card_open_count > 0
     }
 
     pub fn card_release(&mut self) -> Result<(), TunerError> {

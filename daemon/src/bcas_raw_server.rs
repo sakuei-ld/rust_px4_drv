@@ -50,6 +50,17 @@ pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(device: Arc<Mutex<Px4Devic
             }
         };
 
+        // クライアントが現在カードセッションを保持している場合、
+        // T=1シーケンスへの割り込みリセットを避けるためこのサイクルはスキップする
+        // (クライアント側は card_transceive の失敗時に自前でリトライ+リセットする)
+        if dev.card_in_use() {
+            tracing::debug!("[bcas] card in use by a client, skipping monitor check");
+            continue;
+        }
+
+        // debug
+        let detect_start = std::time::Instant::now();
+
         // カードが検出されているか確認
         let detected = dev.card_detect().unwrap_or(false);
 
@@ -65,6 +76,11 @@ pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(device: Arc<Mutex<Px4Devic
                 }
                 let _ = dev.card_release();
             }
+        }
+
+        let detect_ms = detect_start.elapsed().as_millis();
+        if detect_ms > 50 {
+            tracing::warn!("card_detect slow: {}ms", detect_ms);
         }
     }
 }
@@ -83,14 +99,35 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
     info!("BCAS raw client connected: {}", peer);
 
     // 1. クライアント接続開始時に card_acquire を呼ぶ
-    {
+    let need_reinit = {
         let mut dev = device
             .lock()
             .map_err(|e| DaemonError::Unknown(format!("Mutex poisoned: {}", e)))?;
-        if let Err(e) = dev.card_acquire() {
-            error!("Failed to acquire card for client {}: {:?}", peer, e);
+        match dev.card_acquire() {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to acquire card for client {}: {:?}", peer, e);
+                return Ok(());
+            }
+        }
+    };
+
+    // 新規セッションの場合は、電源再投入直後のプロトコル状態(ボーレート/T=1シーケンス)を
+    // 信用せず、必ず full_reset() でATRから取り直す
+    if need_reinit {
+        let mut dev = device
+            .lock()
+            .map_err(|e| DaemonError::Unknown(format!("Mutex poisoned: {}", e)))?;
+        if let Err(e) = dev.card_full_reset() {
+            error!(
+                "[bcas] card_full_reset failed at session start for client {}: {:?}",
+                peer, e
+            );
+            // カードが使える状態ではないため、リトライさせずここで切断する
+            let _ = dev.card_release();
             return Ok(());
         }
+        info!("[bcas] card re-initialized for new session: {}", peer);
     }
 
     // クライアント切断時に確実にな card_release されるようにスコープガードを仕込む
@@ -136,6 +173,9 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
         let res = {
             let mut attempt = 0;
             loop {
+                // debug
+                let lock_wait_start = std::time::Instant::now();
+
                 let mut dev = match device.lock() {
                     Ok(g) => g,
                     Err(e) => {
@@ -143,6 +183,10 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
                         break Err(e.to_string());
                     }
                 };
+
+                let lock_wait_ms = lock_wait_start.elapsed().as_millis();
+
+                let xfer_start = std::time::Instant::now();
 
                 // Px4Device 側の card_transceive を呼び出す
                 match dev.card_transceive(&req) {
@@ -173,6 +217,15 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
                         drop(dev);
                         std::thread::sleep(std::time::Duration::from_millis(RETRY_INTERVAL_MS));
                     }
+                }
+
+                let xfer_ms = xfer_start.elapsed().as_millis();
+
+                if xfer_ms > 50 || lock_wait_ms > 20 {
+                    warn!(
+                        "card_transceive slow: xfer={}ms lock_wait={}ms client={}",
+                        xfer_ms, lock_wait_ms, peer
+                    );
                 }
             }
         };

@@ -283,6 +283,9 @@ impl BusOps for UsbBusRusb {
                         bytes as f64 / 1024.0 / 1024.0 / 5.0
                     );
 
+                    let (ctrl_count, ctrl_bytes) = crate::drivers::it930x::take_ctrl_stats(); // 型パラメータの都合は要調整
+                    info!("ctrl bus: msgs={} bytes={} (last 5s)", ctrl_count, ctrl_bytes);
+
                     if drops > 0 {
                         warn!(
                             "{} USB packets dropped in the last 5 secs (parser thread too slow.)",

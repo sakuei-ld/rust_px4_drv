@@ -8,6 +8,19 @@ use std::sync::Mutex;
 
 use crate::drivers::itedtv_bus::{BusError, BusOps};
 
+// debug用
+static CTRL_MSG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CTRL_MSG_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// どこか定期実行される場所(例えばconsumerループと同じ5秒周期)から呼べる getter
+pub fn take_ctrl_stats() -> (u64, u64) {
+    (
+        CTRL_MSG_COUNT.swap(0, Ordering::Relaxed),
+        CTRL_MSG_BYTES.swap(0, Ordering::Relaxed),
+    )
+}
+
+
 // これに関しては、いろんなところで使うので、実際はここじゃない方が良いかもしれない。
 // 下記2つで i2c_comm.h 17 〜 26 の移植
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +118,10 @@ fn dump_hex(label: &str, data: &[u8]) {
 impl<B: BusOps> IT930x<B> {
     // it930x.c 78〜176 の移植 ... おそらく Mutex が要るので、あとで調査する。
     pub fn ctrl_msg(&self, cmd: u16, wdata: &[u8], rdata: &mut [u8]) -> Result<(), CtrlMsgError> {
+        // debug
+        CTRL_MSG_COUNT.fetch_add(1, Ordering::Relaxed);
+        CTRL_MSG_BYTES.fetch_add(wdata.len() as u64, Ordering::Relaxed);
+
         // Mutex
         let _lock = self.ctrl_lock.lock().unwrap();
 
@@ -1208,6 +1225,7 @@ impl<B: BusOps> IT930x<B> {
         }
     }
 }
+
 impl<B: BusOps> Drop for IT930x<B> {
     fn drop(&mut self) {
         info!("Terminating IT930x device...");
