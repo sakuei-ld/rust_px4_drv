@@ -228,12 +228,19 @@ struct TargetPort {
     interval_sent_batches: u64,
     interval_sent_bytes: u64,
     interval_dropped_batches: u64,
+    interval_cc_errors: u64,        // 追加
+    interval_cc_error_packets: u64, // 追加: 推定損失パケット数(CC差分の合計)
 
     // Drop 調査用
     // セッション全体の累積（ストリーム終了時のサマリ用、リセットしない）
     total_sent_batches: u64,
     total_sent_bytes: u64,
     total_dropped_batches: u64,
+    total_cc_errors: u64,        // 追加
+    total_cc_error_packets: u64, // 追加
+
+    // Drop 調査用
+    last_cc: Option<u8>, // 追加: 直前パケットのCC値(0-15)
 }
 
 // ストリーム処理部分
@@ -271,9 +278,14 @@ impl Px4StreamContext {
                 interval_sent_batches: 0,
                 interval_sent_bytes: 0,
                 interval_dropped_batches: 0,
+                interval_cc_errors: 0,
+                interval_cc_error_packets: 0,
                 total_sent_batches: 0,
                 total_sent_bytes: 0,
                 total_dropped_batches: 0,
+                total_cc_errors: 0,
+                total_cc_error_packets: 0,
+                last_cc: None,
             })
             .collect();
 
@@ -354,9 +366,40 @@ impl Px4StreamContext {
                     self.stream_buffer[offset] = 0x47;
                     let packet = &self.stream_buffer[offset..offset + 188];
 
+                    // Drop 調査用
+                    // TSヘッダのadaptation_field_control/continuity_counterはbyte[3]
+                    // (px4_drvのidタグはbyte[0]の下位ニブルを間借りしているだけで、
+                    //  byte[3]の標準CCフィールドはそのまま生きている)
+                    let adaptation_field_control = (packet[3] & 0x30) >> 4;
+                    let cc = packet[3] & 0x0f;
+
                     // [最適化] クロージャの find をやめ、単純なループで比較 (O(N)の高速化)
                     for t in &mut self.targets {
                         if t.port_number == id {
+                            // Drop 調査用
+                            // adaptation_field_control == 0(予約値、通常は現れない)は
+                            // CCが不定義なのでスキップする
+                            if adaptation_field_control != 0 {
+                                if let Some(prev) = t.last_cc {
+                                    // ヌルパケット(PID=0x1FFF)はCCが更新されないことがあるため、
+                                    // 本来はPID単位で見るべきだが、まずはport単位の簡易チェックとする。
+                                    let expected = (prev + 1) & 0x0f;
+                                    if cc != expected {
+                                        // 巡回差分から推定欠落パケット数を計算(4bitのラップアラウンドを考慮)
+                                        let lost = ((cc as i16 - expected as i16) & 0x0f) as u64;
+                                        t.interval_cc_errors += 1;
+                                        t.interval_cc_error_packets += lost;
+                                        t.total_cc_errors += 1;
+                                        t.total_cc_error_packets += lost;
+                                        warn!(
+                            "port {} CC discontinuity: expected={} got={} (est. {} packet(s) lost)",
+                            t.port_number, expected, cc, lost
+                        );
+                                    }
+                                }
+                                t.last_cc = Some(cc);
+                            }
+
                             t.buffer.extend_from_slice(packet);
                             break;
                         }
@@ -426,10 +469,10 @@ impl Px4StreamContext {
             );
 
             for t in &self.targets {
-                if t.interval_dropped_batches > 0 {
+                if t.interval_dropped_batches > 0 || t.interval_cc_errors > 0 {
                     warn!(
-                        "port {} dropped_batches={} in the last interval (channel full)",
-                        t.port_number, t.interval_dropped_batches
+                        "port {} dropped_batches={} cc_errors={} (est. {} packets) in the last interval",
+                        t.port_number, t.interval_dropped_batches, t.interval_cc_errors, t.interval_cc_error_packets
                     );
                 }
             }
@@ -468,8 +511,9 @@ impl Px4StreamContext {
         );
         for t in &self.targets {
             info!(
-                "  port {}: sent_batches={} sent_bytes={} dropped_batches={}",
-                t.port_number, t.total_sent_batches, t.total_sent_bytes, t.total_dropped_batches
+                "  port {}: sent_batches={} sent_bytes={} dropped_batches={} cc_errors={} (est. {} packets lost)",
+                t.port_number, t.total_sent_batches, t.total_sent_bytes,
+                t.total_dropped_batches, t.total_cc_errors, t.total_cc_error_packets
             );
         }
     }
