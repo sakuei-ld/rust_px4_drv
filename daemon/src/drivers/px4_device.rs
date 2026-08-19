@@ -240,7 +240,8 @@ struct TargetPort {
     total_cc_error_packets: u64, // 追加
 
     // Drop 調査用
-    last_cc: Option<u8>, // 追加: 直前パケットのCC値(0-15)
+    // 直前パケットのCC値(0-15)
+    last_cc_by_pid: std::collections::HashMap<u16, u8>,
 }
 
 // ストリーム処理部分
@@ -285,7 +286,7 @@ impl Px4StreamContext {
                 total_dropped_batches: 0,
                 total_cc_errors: 0,
                 total_cc_error_packets: 0,
-                last_cc: None,
+                last_cc_by_pid: std::collections::HashMap::new(),
             })
             .collect();
 
@@ -367,9 +368,9 @@ impl Px4StreamContext {
                     let packet = &self.stream_buffer[offset..offset + 188];
 
                     // Drop 調査用
-                    // TSヘッダのadaptation_field_control/continuity_counterはbyte[3]
-                    // (px4_drvのidタグはbyte[0]の下位ニブルを間借りしているだけで、
-                    //  byte[3]の標準CCフィールドはそのまま生きている)
+                    // TSヘッダ標準フィールド
+                    let transport_error = (packet[1] & 0x80) != 0;
+                    let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
                     let adaptation_field_control = (packet[3] & 0x30) >> 4;
                     let cc = packet[3] & 0x0f;
 
@@ -379,8 +380,15 @@ impl Px4StreamContext {
                             // Drop 調査用
                             // adaptation_field_control == 0(予約値、通常は現れない)は
                             // CCが不定義なのでスキップする
-                            if adaptation_field_control != 0 {
-                                if let Some(prev) = t.last_cc {
+                            // NULLパケット(PID=0x1FFF)はCC無意味なので対象外。
+                            // transport_error_indicatorが立っているパケットや、
+                            // adaptation_field_control==0(予約)/2(adaptationのみ、payload無し)もCC対象外
+                            // (規格上、この2パターンはCCが更新されない/不定)。
+                            if pid != 0x1FFF
+                                && !transport_error
+                                && (adaptation_field_control == 1 || adaptation_field_control == 3)
+                            {
+                                if let Some(prev) = t.last_cc_by_pid.get(&pid) {
                                     // ヌルパケット(PID=0x1FFF)はCCが更新されないことがあるため、
                                     // 本来はPID単位で見るべきだが、まずはport単位の簡易チェックとする。
                                     let expected = (prev + 1) & 0x0f;
@@ -391,13 +399,9 @@ impl Px4StreamContext {
                                         t.interval_cc_error_packets += lost;
                                         t.total_cc_errors += 1;
                                         t.total_cc_error_packets += lost;
-                                        warn!(
-                            "port {} CC discontinuity: expected={} got={} (est. {} packet(s) lost)",
-                            t.port_number, expected, cc, lost
-                        );
                                     }
                                 }
-                                t.last_cc = Some(cc);
+                                t.last_cc_by_pid.insert(pid, cc);
                             }
 
                             t.buffer.extend_from_slice(packet);
