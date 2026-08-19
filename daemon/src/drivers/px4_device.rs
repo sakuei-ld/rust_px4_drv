@@ -976,18 +976,20 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 
         if self.streaming_count == 0 {
             // Px4StreamContext を生成し、1つの Mutex で包む
-            let stream_ctx = Px4StreamContext::new(&self.px4chrdev);
-            let ctx_mutex = Mutex::new(stream_ctx);
+            let stream_ctx = Arc::new(Mutex::new(Px4StreamContext::new(&self.px4chrdev)));
+            let ctx_for_closure = stream_ctx.clone();
 
             // ストリームハンドラの開始
             if let Err(e) = self.it930x.start_streaming(move |data| {
                 // USB受信1回につき、ロックの取得はこれ1回だけ
-                let mut ctx = ctx_mutex.lock().unwrap();
+                let mut ctx = ctx_for_closure.lock().unwrap();
                 ctx.process_stream(data);
             }) {
                 let _ = self.px4chrdev[target_idx].tuner.enable_ts_pins(false);
                 return Err(e.into());
             }
+
+            self.stream_ctx = Some(stream_ctx); // ← この1行が抜けていた
         }
 
         info!("port {} start capture.", target_idx);
@@ -1149,6 +1151,13 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         }
 
         Ok((PX4_CHRDEV_CONFIGS[target_idx].options & 0x00000040) != 0)
+    }
+
+    /// バックエンド電源(チューナー+カードスロット共有系統)が現在投入されているか。
+    /// backend_set_power() の呼び出し条件(open_count==0 && card_open_count==0 → OFF)
+    /// と対になるチェック。
+    pub fn is_backend_powered(&self) -> bool {
+        self.open_count > 0 || self.card_open_count > 0
     }
 }
 

@@ -210,11 +210,11 @@ fn main() -> anyhow::Result<()> {
         // BCAS 側のAcceptループを scoped thread で起動
         if let Some(bcas_raw_listener) = &bcas_setup {
             // カード監視ループ（新規追加）
-            let dev_monitor = Arc::clone(&shared_device);
-            s.spawn(move || {
-                info!("[bcas] Card monitor loop started");
-                rust_px4_drv_daemon::bcas_raw_server::card_monitor_loop(dev_monitor);
-            });
+            //let dev_monitor = Arc::clone(&shared_device);
+            //s.spawn(move || {
+            //    info!("[bcas] Card monitor loop started");
+            //    rust_px4_drv_daemon::bcas_raw_server::card_monitor_loop(dev_monitor);
+            //});
 
             // bcs-perl.pl 互換バイナリプロトコル用のAcceptループ
             let dev = Arc::clone(&shared_device);

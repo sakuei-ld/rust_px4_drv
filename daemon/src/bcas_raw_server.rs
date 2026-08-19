@@ -28,6 +28,7 @@ const RETRY_INTERVAL_MS: u64 = 200;
 ///
 /// このループは、main.rs の外側の `std::thread::scope` の中で
 /// `s.spawn(...)` により起動されることを前提とする（'static を要求しない）。
+/*
 pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(device: Arc<Mutex<Px4Device<'a, B>>>) {
     loop {
         if SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
@@ -58,6 +59,15 @@ pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(device: Arc<Mutex<Px4Devic
             continue;
         }
 
+        // バックエンド電源が切れている間は、カードも給電されておらず
+        // detect() の結果自体に意味がないため、無駄な電源サイクルを避けてスキップする。
+        // 電源が入り直すタイミング(card_acquire()のwas_card_idle)で
+        // 必ず full_reset() による再検証が走るので、ここで先回りする必要はない。
+        if !dev.is_backend_powered() {
+            tracing::debug!("[bcas] backend power is off, skipping card monitor check");
+            continue;
+        }
+
         // Drop 調査用(BCAS処理時間の計測)
         let detect_start = std::time::Instant::now();
 
@@ -85,6 +95,7 @@ pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(device: Arc<Mutex<Px4Devic
         }
     }
 }
+*/
 
 /// スレッド内で実行される単一クライアントの処理
 ///
