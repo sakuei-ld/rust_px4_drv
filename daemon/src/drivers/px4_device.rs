@@ -489,6 +489,8 @@ impl Px4StreamContext {
                 t.interval_sent_batches = 0;
                 t.interval_sent_bytes = 0;
                 t.interval_dropped_batches = 0;
+                t.interval_cc_errors = 0;
+                t.interval_cc_error_packets = 0;
             }
 
             self.debug_last_log = std::time::Instant::now();
