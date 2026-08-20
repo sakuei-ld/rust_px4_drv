@@ -1,6 +1,6 @@
 use tracing::{info, warn};
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
 use crate::drivers::itedtv_bus::BusOps;
@@ -32,11 +32,11 @@ const RT720_LNA_ACC_GAIN: [i32; 32] = [
 
 // px4_device.c の定義を、こっちでしか使わないので移動
 // BS/CS用 (ISDB-S) 初期化パラメータ
-const TC_INIT_S: [(u8, &'static [u8]); 3] = [(0x15, &[0x00]), (0x1d, &[0x00]), (0x04, &[0x02])];
+const TC_INIT_S: [(u8, &[u8]); 3] = [(0x15, &[0x00]), (0x1d, &[0x00]), (0x04, &[0x02])];
 
 // px4_device.c の定義を、こっちでしか使わないので移動
 // デバイス全体の初期化用 (BS/CS)
-const TC_INIT_S0: [(u8, &'static [u8]); 2] = [(0x07, &[0x31]), (0x08, &[0x77])];
+const TC_INIT_S0: [(u8, &[u8]); 2] = [(0x07, &[0x31]), (0x08, &[0x77])];
 
 #[derive(Default, Clone, Copy)]
 struct BandwidthParam {
@@ -194,15 +194,15 @@ pub struct RT710Priv {
     chip: RT710ChipType,
 }
 
-pub struct RT710<'a, B: BusOps> {
-    tc90522: TC90522<'a, B>,
+pub struct RT710<B: BusOps> {
+    tc90522: TC90522<B>,
     //pub i2c_bus: u8,
     pub i2c_addr: u8,
     config: RT710Config,
     priv_: Mutex<RT710Priv>,
 }
 
-impl<'a, B: BusOps> RT710<'a, B> {
+impl<B: BusOps> RT710<B> {
     // bit反転
     fn reverse_bit(val: u8) -> u8 {
         let mut t = val;
@@ -214,7 +214,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
 
     // レジストリ読み取り
     fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
-        if (buf.len() == 0) || (buf.len() > NUM_REGS - reg as usize) {
+        if (buf.is_empty()) || (buf.len() > NUM_REGS - reg as usize) {
             return Err(CtrlMsgError::InvalidLength);
         }
 
@@ -247,7 +247,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
 
     // レジストリ書き込み
     fn write_regs(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
-        if (buf.len() == 0) || (buf.len() > (NUM_REGS - reg as usize)) {
+        if (buf.is_empty()) || (buf.len() > (NUM_REGS - reg as usize)) {
             return Err(CtrlMsgError::InvalidLength);
         }
 
@@ -385,7 +385,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
 
     // インスタンス生成
     pub fn new(
-        it930x: &'a IT930x<B>,
+        it930x: Arc<IT930x<B>>,
         tc90522_bus: u8,
         tc90522_addr: u8,
         is_secondary: bool,
@@ -591,8 +591,8 @@ impl<'a, B: BusOps> RT710<'a, B> {
         if priv_data.chip == RT710ChipType::RT710 {
             if bandwidth >= 380000 {
                 let diff = bandwidth - 380000;
-                bw_param.coarse = 0x10 + ((diff / 17400) as u8 & 0xff);
-                if (diff % 17400) != 0 {
+                bw_param.coarse = 0x10 + ((diff / 17400) as u8);
+                if !diff.is_multiple_of(17400) {
                     bw_param.coarse += 1;
                 }
                 bw_param.fine = 1;
@@ -627,7 +627,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
             } else if s <= (368000 + range) {
                 let val = s - 88000 - range;
                 bw_param.coarse = (val / 20000) as u8;
-                if (val % 20000) != 0 {
+                if !val.is_multiple_of(20000) {
                     bw_param.coarse += 1;
                 }
                 if bw_param.coarse > 6 {
@@ -637,7 +637,7 @@ impl<'a, B: BusOps> RT710<'a, B> {
                 let val = s - 368000 - range;
                 bw_param.coarse = ((val / 20000) + 15) as u8;
                 // Cコードの特殊な剰余判定: (s + 25216 - range) % 20000
-                if ((s + 25216).wrapping_sub(range) % 20000) != 0 {
+                if !(s + 25216).wrapping_sub(range).is_multiple_of(20000) {
                     bw_param.coarse += 1;
                 }
 
@@ -756,15 +756,14 @@ impl<'a, B: BusOps> RT710<'a, B> {
     }
 }
 
-impl<'a, B: BusOps> Tuner for RT710<'a, B> {
+impl<B: BusOps> Tuner for RT710<B> {
     // チューナー初期化
     fn init(&mut self) -> Result<(), TunerError> {
         // debug
         info!("init()");
 
-        let mut chip_type = RT710ChipType::UNKNOWN;
         let mut tmp = [0u8; 1];
-        {
+        let chip_type = {
             //let _lock = self.priv_.lock.lock().unwrap();
             let mut priv_data = self.priv_.lock().unwrap();
 
@@ -782,8 +781,8 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
             priv_data.init = true;
 
             // debug用
-            chip_type = priv_data.chip
-        }
+            priv_data.chip
+        };
 
         // いらないのでは？
         info!(
@@ -824,7 +823,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
 
         // 逆の順序で終了させる
         // 1. チューナー自身をスリープ
-        self.sleep(&*priv_data)?;
+        self.sleep(&priv_data)?;
 
         // 2. 復調器の TS出力 を無効化
         self.tc90522.enable_ts_pins(false)?;
@@ -905,7 +904,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
     }
 
     fn read_cnr_raw(&self) -> Result<u32, TunerError> {
-        self.tc90522.get_cn().map_err(|e| TunerError::CtrlMsg(e))
+        self.tc90522.get_cn().map_err(TunerError::CtrlMsg)
     }
 
     fn set_stream_id(&mut self, stream_id: u16) -> Result<(), TunerError> {
@@ -963,7 +962,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
             info!("[rt710] terminating tuner...");
 
             // 1. 自身のハードウェアをスリープ
-            let _ = self.sleep(&*priv_data);
+            let _ = self.sleep(&priv_data);
 
             // 2. 状態をクリア
             priv_data.init = false;
@@ -985,7 +984,7 @@ impl<'a, B: BusOps> Tuner for RT710<'a, B> {
     */
 }
 
-impl<'a, B: BusOps> Drop for RT710<'a, B> {
+impl<B: BusOps> Drop for RT710<B> {
     // インスタンス破棄時に、初期化フラグをリセット
     // (保険としての終了処理で、エラーは無視)
     fn drop(&mut self) {
@@ -994,7 +993,7 @@ impl<'a, B: BusOps> Drop for RT710<'a, B> {
             if priv_data.init {
                 priv_data.init = false;
                 priv_data.freq = 0;
-                let _ = self.sleep(&*priv_data);
+                let _ = self.sleep(&priv_data);
                 info!("RT710 dropped and terminated.");
 
                 // メモ: tc90522 は構造体のメンバなので、この後自動的に tc90522 の drop() が呼ばれる。

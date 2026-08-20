@@ -120,20 +120,22 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let it930x = IT930x::new(bus);
+    let it930x = Arc::new(IT930x::new(bus));
 
     // デバイスの初期化と共有管理
-    let (device, receivers) =
-        match Px4Device::new(&it930x, device_type == Px4DeviceType::PX_Q3U4, false) {
-            Ok(v) => v,
-            Err(e) => {
-                anyhow::bail!("Failed to init Px4Device: {:?}", e);
-            }
-        };
+    let (device, receivers) = match Px4Device::new(
+        Arc::clone(&it930x),
+        device_type == Px4DeviceType::PX_Q3U4,
+        false,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            anyhow::bail!("Failed to init Px4Device: {:?}", e);
+        }
+    };
 
     let shared_receivers = Arc::new(receivers);
-    let shared_device: Arc<Mutex<Px4Device<'static, UsbBusRusb>>> =
-        unsafe { Arc::new(Mutex::new(std::mem::transmute(device))) };
+    let shared_device = Arc::new(Mutex::new(device));
 
     // BCAS 用の準備（BcasCard作成・初期化・リスナーbind）
     let bcas_setup: Option<TcpListener> = if cli.enable_bcas {

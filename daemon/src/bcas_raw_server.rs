@@ -23,86 +23,12 @@ use crate::server::SHUTDOWN;
 const MAX_RETRIES: usize = 3;
 const RETRY_INTERVAL_MS: u64 = 200;
 
-/// カードの抜き差しを監視し、必要なら再初期化する。
-/// bcs-perl.pl のメインループにおける Status() チェック相当。
-///
-/// このループは、main.rs の外側の `std::thread::scope` の中で
-/// `s.spawn(...)` により起動されることを前提とする（'static を要求しない）。
-/*
-pub fn card_monitor_loop<'a, B: BusOps + Send + Sync>(device: Arc<Mutex<Px4Device<'a, B>>>) {
-    loop {
-        if SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
-            tracing::info!("[bcas] Card monitor loop shutting down");
-            break;
-        }
-
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
-        // SHUTDOWNが立った直後にsleepから復帰した場合に備えて再確認
-        if SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-
-        let mut dev = match device.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::error!("Px4Device mutex poisoned: {}", e);
-                continue;
-            }
-        };
-
-        // クライアントが現在カードセッションを保持している場合、
-        // T=1シーケンスへの割り込みリセットを避けるためこのサイクルはスキップする
-        // (クライアント側は card_transceive の失敗時に自前でリトライ+リセットする)
-        if dev.card_in_use() {
-            tracing::debug!("[bcas] card in use by a client, skipping monitor check");
-            continue;
-        }
-
-        // バックエンド電源が切れている間は、カードも給電されておらず
-        // detect() の結果自体に意味がないため、無駄な電源サイクルを避けてスキップする。
-        // 電源が入り直すタイミング(card_acquire()のwas_card_idle)で
-        // 必ず full_reset() による再検証が走るので、ここで先回りする必要はない。
-        if !dev.is_backend_powered() {
-            tracing::debug!("[bcas] backend power is off, skipping card monitor check");
-            continue;
-        }
-
-        // Drop 調査用(BCAS処理時間の計測)
-        let detect_start = std::time::Instant::now();
-
-        // カードが検出されているか確認
-        let detected = dev.card_detect().unwrap_or(false);
-
-        // カードが検出されない場合、再初期化を試みる
-        if !detected {
-            tracing::warn!("BCAS card not detected, attempting re-initialization");
-
-            // 一時的に電源を入れて再リセットを試みる
-            if dev.card_acquire().is_ok() {
-                match dev.card_full_reset() {
-                    Ok(_) => tracing::info!("BCAS card re-initialized successfully"),
-                    Err(e) => tracing::warn!("BCAS card re-initialization failed: {}", e),
-                }
-                let _ = dev.card_release();
-            }
-        }
-
-        // Drop 調査用(BCAS処理時間の計測)
-        let detect_ms = detect_start.elapsed().as_millis();
-        if detect_ms > 50 {
-            tracing::warn!("card_detect slow: {}ms", detect_ms);
-        }
-    }
-}
-*/
-
 /// スレッド内で実行される単一クライアントの処理
 ///
 /// main.rs の scoped thread から呼び出されることを想定している。
 pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
     mut stream: TcpStream,
-    device: Arc<Mutex<Px4Device<'_, B>>>,
+    device: Arc<Mutex<Px4Device<B>>>,
 ) -> DaemonResult<()> {
     let peer = stream
         .peer_addr()
@@ -144,8 +70,8 @@ pub fn handle_raw_client_thread<B: BusOps + Send + Sync>(
 
     // クライアント切断時に確実にな card_release されるようにスコープガードを仕込む
     // （または struct の Drop や defer パターン）
-    struct CardGuard<'a, B: BusOps + Send + Sync>(Arc<Mutex<Px4Device<'a, B>>>);
-    impl<'a, B: BusOps + Send + Sync> Drop for CardGuard<'a, B> {
+    struct CardGuard<B: BusOps + Send + Sync>(Arc<Mutex<Px4Device<B>>>);
+    impl<B: BusOps + Send + Sync> Drop for CardGuard<B> {
         fn drop(&mut self) {
             if let Ok(mut dev) = self.0.lock() {
                 let _ = dev.card_release();

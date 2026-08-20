@@ -3,7 +3,7 @@
 use thiserror::Error;
 use tracing::{info, warn};
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // 多分、これで大丈夫だと思う。
 use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
@@ -37,8 +37,8 @@ pub enum System {
     IsdbT,
 }
 
-pub struct TC90522<'a, B: BusOps> {
-    it930x: &'a IT930x<B>,
+pub struct TC90522<B: BusOps> {
+    it930x: Arc<IT930x<B>>,
 
     // I2C バスアクセス用
     pub bus: u8,
@@ -57,10 +57,10 @@ pub struct TC90522<'a, B: BusOps> {
     // デバイスの状態を保持しておく方が良いかも？
 }
 
-impl<'a, B: BusOps> TC90522<'a, B> {
+impl<B: BusOps> TC90522<B> {
     // インスタンス生成(各チューナーごとの個別設定)
     pub fn new(
-        it930x: &'a IT930x<B>,
+        it930x: Arc<IT930x<B>>,
         bus: u8,
         i2c_addr: u8,
         system: System,
@@ -418,7 +418,7 @@ impl<'a, B: BusOps> TC90522<'a, B> {
 }
 
 // term() の代わり および Rust として、終了時に適切にデバイスを止めるための実装をここで行う。
-impl<'a, B: BusOps> Drop for TC90522<'a, B> {
+impl<B: BusOps> Drop for TC90522<B> {
     fn drop(&mut self) {
         // Cコードの tc90522_term() 相当の処理
         // デバイスをスリープ状態にする

@@ -68,9 +68,9 @@ pub struct IT930x<B: BusOps> {
 // Checksum ... it930x.c 58 〜 76 の移植
 fn calc_checksum(buf: &[u8]) -> u16 {
     let mut sum: u16 = 0;
-    let mut iter = buf.chunks(2);
+    let iter = buf.chunks(2);
 
-    while let Some(chunk) = iter.next() {
+    for chunk in iter {
         let word = match chunk {
             [a, b] => ((*a as u16) << 8) | (*b as u16),
             [a] => (*a as u16) << 8,
@@ -629,9 +629,7 @@ impl<B: BusOps> IT930x<B> {
         let ret2 = self.write_reg_mask(0xda1d, 0x00, 0x01);
         let ret3 = self.write_regs(0xd920, &[0]);
 
-        if ret.is_err() {
-            return ret;
-        }
+        ret?;
         ret2?;
         ret3?;
 
@@ -1031,18 +1029,15 @@ impl<B: BusOps> IT930x<B> {
 
             if write_len > 48 {
                 write_buf[0] = 48;
-                for i in 0..48 {
-                    write_buf[i + 1] = data[buf_idx + i];
-                }
+                write_buf[1..(48 + 1)].copy_from_slice(&data[buf_idx..(48 + buf_idx)]);
 
                 self.ctrl_msg(IT930X_CMD_UART_WRITE, &write_buf, &mut [])?;
                 buf_idx += 48;
                 write_len -= 48;
             } else {
                 write_buf[0] = write_len as u8;
-                for i in 0..write_len {
-                    write_buf[i + 1] = data[buf_idx + i];
-                }
+                write_buf[1..(write_len + 1)]
+                    .copy_from_slice(&data[buf_idx..(write_len + buf_idx)]);
 
                 self.ctrl_msg(IT930X_CMD_UART_WRITE, &write_buf[..write_len + 1], &mut [])?;
                 buf_idx += write_len;

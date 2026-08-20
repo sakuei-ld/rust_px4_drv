@@ -85,9 +85,9 @@ const PX4_CHRDEV_CONFIGS: [ChrdevConfig; 4] = [
     },
 ];
 
-pub enum TunerInstance<'a, B: BusOps> {
-    Satellite(RT710<'a, B>),
-    Terrestrial(R850<'a, B>),
+pub enum TunerInstance<B: BusOps> {
+    Satellite(RT710<B>),
+    Terrestrial(R850<B>),
 }
 
 pub trait Tuner {
@@ -121,7 +121,7 @@ pub trait Tuner {
     fn term(&mut self) -> Result<(), TunerError>;
 }
 
-impl<'a, B: BusOps> Tuner for TunerInstance<'a, B> {
+impl<B: BusOps> Tuner for TunerInstance<B> {
     fn init(&mut self) -> Result<(), TunerError> {
         match self {
             TunerInstance::Satellite(t) => t.init(),
@@ -576,9 +576,9 @@ impl<T: Tuner> Px4Chrdev<T> {
     }
 }
 
-pub struct Px4Device<'a, B: BusOps + Sync> {
-    it930x: &'a IT930x<B>,
-    px4chrdev: Vec<Px4Chrdev<TunerInstance<'a, B>>>,
+pub struct Px4Device<B: BusOps + Sync> {
+    it930x: Arc<IT930x<B>>,
+    px4chrdev: Vec<Px4Chrdev<TunerInstance<B>>>,
 
     open_count: usize,
     lnb_power_count: usize,
@@ -589,7 +589,7 @@ pub struct Px4Device<'a, B: BusOps + Sync> {
     use_mldev: bool,
 
     // B-CAS カードリーダー用
-    card: Option<BcasCard<'a, B>>,
+    card: Option<BcasCard<B>>,
     card_open_count: usize,
 
     // Drop 調査用
@@ -599,14 +599,14 @@ pub struct Px4Device<'a, B: BusOps + Sync> {
     stream_ctx: Option<Arc<Mutex<Px4StreamContext>>>,
 }
 
-impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
+impl<B: BusOps + Sync> Px4Device<B> {
     /// Get a reference to the underlying IT930x device (wrapped in Option for API compatibility)
-    pub fn get_it930x(&self) -> Option<&'a IT930x<B>> {
-        Some(self.it930x)
+    pub fn get_it930x(&self) -> Option<Arc<IT930x<B>>> {
+        Some(Arc::clone(&self.it930x))
     }
 
     pub fn new(
-        it930x: &'a IT930x<B>,
+        it930x: Arc<IT930x<B>>,
         use_mldev: bool,
         discard_null_packets: bool,
     ) -> Result<(Self, Vec<Receiver<Bytes>>), TunerError> {
@@ -664,7 +664,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             for i in 0..PX4_CHRDEV_CONFIGS.len() {
                 it930x
                     .set_pid_filter(i, Some(&filter))
-                    .map_err(|e| TunerError::from(e))?;
+                    .map_err(TunerError::from)?;
             }
         }
 
@@ -690,13 +690,13 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
             // 1. Tuner構造体を作成
             let tuner = match config.system {
                 System::IsdbS => TunerInstance::Satellite(RT710::new(
-                    &it930x,
+                    Arc::clone(&it930x),
                     2,
                     config.addr,
                     config.is_secondary,
                 )?),
                 System::IsdbT => TunerInstance::Terrestrial(R850::new(
-                    &it930x,
+                    Arc::clone(&it930x),
                     2,
                     config.addr,
                     config.is_secondary,
@@ -721,13 +721,13 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
         }
 
         let device = Self {
-            it930x,
+            it930x: Arc::clone(&it930x),
             px4chrdev,
             open_count: 0,
             lnb_power_count: 0,
             streaming_count: 0,
             use_mldev,
-            card: Some(BcasCard::new(&it930x)),
+            card: Some(BcasCard::new(Arc::clone(&it930x))),
             card_open_count: 0,
             // Drop 調査用
             stream_ctx: None,
@@ -1168,7 +1168,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
 }
 
 // B-CAS Card 関連
-impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
+impl<B: BusOps + Sync> Px4Device<B> {
     /// カード使用開始。必要なら backend 電源を投入する。
     /// 既存の tuner 用ロジックと同じ self の中で完結させることで、
     /// 呼び出し元は Arc<Mutex<Px4Device>> の同じロックの中で実行される。
@@ -1218,7 +1218,7 @@ impl<'a, B: BusOps + Sync> Px4Device<'a, B> {
     }
 }
 
-impl<'a, B: BusOps + Sync> Drop for Px4Device<'a, B> {
+impl<B: BusOps + Sync> Drop for Px4Device<B> {
     fn drop(&mut self) {
         info!("Dropping device, ensuring power is off...");
         // 電源が入ったままなら強制的に切る

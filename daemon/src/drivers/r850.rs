@@ -1,6 +1,6 @@
 use tracing::{error, info};
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::drivers::it930x::{CtrlMsgError, I2CCommRequest, I2CRequestType, IT930x};
 use crate::drivers::itedtv_bus::BusOps;
@@ -56,7 +56,7 @@ pub const MIXER_ACC_GAIN: [u16; 16] = [
 // px4_device.c の定義を、こっちでしか使わないので移動
 // 地デジ用 (ISDB-T) 初期化パラメータ
 // &[u8] にするために、値の前に `&` をつけ、配列リテラル `[...]` で囲む
-const TC_INIT_T: [(u8, &'static [u8]); 10] = [
+const TC_INIT_T: [(u8, &[u8]); 10] = [
     (0xb0, &[0xa0]),
     (0xb2, &[0x3d]),
     (0xb3, &[0x25]),
@@ -71,7 +71,7 @@ const TC_INIT_T: [(u8, &'static [u8]); 10] = [
 
 // px4_device.c の定義を、こっちでしか使わないので移動
 // デバイス全体の初期化用 (地デジ)
-const TC_INIT_T0: [(u8, &'static [u8]); 2] = [(0x0e, &[0x77]), (0x0f, &[0x13])];
+const TC_INIT_T0: [(u8, &[u8]); 2] = [(0x0e, &[0x77]), (0x0f, &[0x13])];
 
 // 設定
 #[derive(Debug, Clone, Copy)]
@@ -2053,8 +2053,8 @@ pub const SYS_FREQ_PARAMS: &[&[R850SystemFrequencyParams]] = &[
     &[],                   // 9: FM
 ];
 
-pub struct R850<'a, B: BusOps> {
-    tc90522: TC90522<'a, B>,
+pub struct R850<B: BusOps> {
+    tc90522: TC90522<B>,
 
     // 設定パラメータ
     //pub xtal: u32,
@@ -2068,7 +2068,7 @@ pub struct R850<'a, B: BusOps> {
     priv_: Mutex<R850Priv>,
 }
 
-impl<'a, B: BusOps> R850<'a, B> {
+impl<B: BusOps> R850<B> {
     // bit反転
     fn reverse_bit(val: u8) -> u8 {
         let mut t = val;
@@ -2080,7 +2080,7 @@ impl<'a, B: BusOps> R850<'a, B> {
 
     // レジスタ読み取り
     fn read_regs(&self, reg: u8, buf: &mut [u8]) -> Result<(), CtrlMsgError> {
-        if (buf.len() == 0) || (buf.len() > (R850_NUM_REGS - reg as usize)) {
+        if (buf.is_empty()) || (buf.len() > (R850_NUM_REGS - reg as usize)) {
             return Err(CtrlMsgError::InvalidLength);
         }
 
@@ -2113,7 +2113,7 @@ impl<'a, B: BusOps> R850<'a, B> {
 
     // レジスタ書き込み
     fn write_regs(&self, reg: u8, buf: &[u8]) -> Result<(), CtrlMsgError> {
-        if (buf.len() == 0) || (buf.len() > (R850_NUM_REGS - reg as usize)) {
+        if (buf.is_empty()) || (buf.len() > (R850_NUM_REGS - reg as usize)) {
             return Err(CtrlMsgError::InvalidLength);
         }
 
@@ -2742,17 +2742,13 @@ impl<'a, B: BusOps> R850<'a, B> {
         let mut best_idx = 0;
         let mut min_val = 0xffu8;
 
-        for i in 0..3 {
-            // Cコードでは imr_points[3] を宣言するだけなので、一旦、初期値にしておく。
-            // imr_check_iq_tree() 内部で、.value を 0xff に初期化してから使うので不要
-            //imr_points[i].value = 0;
+        for (i, point) in imr_points.iter_mut().enumerate() {
             // 各ポイントについて、フェーズ方向の 3点探索を実行
-            imr_points[i] =
-                self.imr_check_iq_tree(imr_points[i], R850ImrDirection::Phase, 3, priv_data)?;
+            *point = self.imr_check_iq_tree(*point, R850ImrDirection::Phase, 3, priv_data)?;
 
             // 最も ADC値 (value) が低い（＝誤差が少ない）インデックスを記録
-            if min_val > imr_points[i].value {
-                min_val = imr_points[i].value;
+            if min_val > point.value {
+                min_val = point.value;
                 best_idx = i;
             }
         }
@@ -2960,11 +2956,8 @@ impl<'a, B: BusOps> R850<'a, B> {
             // 結果の保存 (Cコードでは、直接書き換えているが、Rust では異なるため)
             priv_data.imr_cal[mixer_mode_idx].imr[j_idx] = current_imr;
 
-            if (current_imr.gain & 0x0f) <= 0x06 && (current_imr.phase & 0x0f) <= 0x06 {
-                priv_data.imr_cal[mixer_mode_idx].result[j_idx] = true;
-            } else {
-                priv_data.imr_cal[mixer_mode_idx].result[j_idx] = false;
-            }
+            priv_data.imr_cal[mixer_mode_idx].result[j_idx] =
+                (current_imr.gain & 0x0f) <= 0x06 && (current_imr.phase & 0x0f) <= 0x06;
 
             if full {
                 // フル探索後はゲイン/フェーズ/iqcapのレジスタをリセット
@@ -3214,10 +3207,8 @@ impl<'a, B: BusOps> R850<'a, B> {
 
         // 3. チップの種類に応じた微調整
         match priv_data.sys_curr.system {
-            R850System::DvbC | R850System::J83B | R850System::IsdbT => {
-                if priv_data.chip != 0 {
-                    prm.filter_top = 6;
-                }
+            R850System::DvbC | R850System::J83B | R850System::IsdbT if priv_data.chip != 0 => {
+                prm.filter_top = 6;
             }
             _ => {}
         }
@@ -3225,13 +3216,12 @@ impl<'a, B: BusOps> R850<'a, B> {
         // 4. レジスタの更新処理
         // Mixer Mode と LO周波数の計算
         priv_data.regs[0x13] &= 0xef;
-        let lo_freq: u32;
-        if priv_data.mixer_mode != 0 {
+        let lo_freq = if priv_data.mixer_mode != 0 {
             priv_data.regs[0x13] |= 0x10;
-            lo_freq = rf_freq - priv_data.sys_curr.if_freq;
+            rf_freq - priv_data.sys_curr.if_freq
         } else {
-            lo_freq = rf_freq + priv_data.sys_curr.if_freq;
-        }
+            rf_freq + priv_data.sys_curr.if_freq
+        };
 
         // NA Power Detect
         priv_data.regs[0x0a] &= 0xbf;
@@ -3487,7 +3477,7 @@ impl<'a, B: BusOps> R850<'a, B> {
 
     // インスタンス生成
     pub fn new(
-        it930x: &'a IT930x<B>,
+        it930x: Arc<IT930x<B>>,
         tc90522_bus: u8,
         tc90522_addr: u8,
         is_secondary: bool,
@@ -3677,7 +3667,7 @@ impl<'a, B: BusOps> R850<'a, B> {
         }
 
         // 40MHz 〜 1002MHz の範囲外ならエラー
-        if freq < 40000 || freq > 1002000 {
+        if !(40000..=1002000).contains(&freq) {
             return Err(TunerError::InvalidState); // CのEINVAL相当
         }
 
@@ -3718,7 +3708,7 @@ impl<'a, B: BusOps> R850<'a, B> {
     }
 }
 
-impl<'a, B: BusOps> Tuner for R850<'a, B> {
+impl<B: BusOps> Tuner for R850<B> {
     // 初期化処理
     fn init(&mut self) -> Result<(), TunerError> {
         // debug
@@ -3755,12 +3745,10 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
         let mut detected = false;
         for _ in 0..4 {
             let mut tmp = [0u8];
-            if self.read_regs(0x00, &mut tmp).is_ok() {
-                if (tmp[0] & 0x98) != 0 {
-                    priv_data.chip = 1;
-                    detected = true;
-                    break;
-                }
+            if self.read_regs(0x00, &mut tmp).is_ok() && (tmp[0] & 0x98) != 0 {
+                priv_data.chip = 1;
+                detected = true;
+                break;
             }
         }
 
@@ -3902,7 +3890,7 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
     }
 
     fn read_cnr_raw(&self) -> Result<u32, TunerError> {
-        self.tc90522.get_cn().map_err(|e| TunerError::CtrlMsg(e))
+        self.tc90522.get_cn().map_err(TunerError::CtrlMsg)
     }
 
     /// 明示的な終了処理
@@ -3945,7 +3933,7 @@ impl<'a, B: BusOps> Tuner for R850<'a, B> {
     }
 }
 
-impl<'a, B: BusOps> Drop for R850<'a, B> {
+impl<B: BusOps> Drop for R850<B> {
     // インスタンス破棄時に、内部状態をクリア
     fn drop(&mut self) {
         // Mutexをロックして内部データにアクセスします。

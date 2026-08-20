@@ -78,12 +78,12 @@ fn send_error(io: &mut ClientIo, msg: impl Into<String>) {
 }
 
 /// RAIIを利用した自動クリーンアップ用構造体 (接続単位で管理)
-struct ClientGuard<'a, B: BusOps + Send + Sync> {
-    device: Arc<std::sync::Mutex<Px4Device<'a, B>>>,
+struct ClientGuard<B: BusOps + Send + Sync> {
+    device: Arc<std::sync::Mutex<Px4Device<B>>>,
     port: Option<usize>,
 }
 
-impl<'a, B: BusOps + Send + Sync> Drop for ClientGuard<'a, B> {
+impl<B: BusOps + Send + Sync> Drop for ClientGuard<B> {
     fn drop(&mut self) {
         // クライアント切断時(エラー終了含む)に必ずキャプチャを停止し、チューナーを閉じる
         if let Some(port) = self.port {
@@ -142,7 +142,7 @@ fn channel_to_freq_khz(config: &protocol::ChannelConfig) -> anyhow::Result<u32> 
         }
         protocol::ChannelSpace::BroadcastingSatellite => {
             // BS: 1〜23ch (奇数のみ)
-            if (1..=23).contains(&config.channel) && config.channel % 2 != 0 {
+            if (1..=23).contains(&config.channel) && !config.channel.is_multiple_of(2) {
                 let ch_idx = config.channel / 2;
                 // 衛星波では sub_channel (slot) は周波数計算には使用しない (Cコードと等価)
                 Ok(1049480 + (38360 * ch_idx))
@@ -155,7 +155,7 @@ fn channel_to_freq_khz(config: &protocol::ChannelConfig) -> anyhow::Result<u32> 
         }
         protocol::ChannelSpace::CommunicationSatellite => {
             // CS: 2〜24ch (偶数のみ)
-            if (2..=24).contains(&config.channel) && config.channel % 2 == 0 {
+            if (2..=24).contains(&config.channel) && !config.channel.is_multiple_of(2) {
                 let ch_idx = config.channel / 2 - 1;
                 // 衛星波では sub_channel (slot) は周波数計算には使用しない (Cコードと等価)
                 Ok(1613000 + (40000 * ch_idx))
@@ -176,7 +176,7 @@ fn channel_to_freq_khz(config: &protocol::ChannelConfig) -> anyhow::Result<u32> 
 pub fn handle_client<B: BusOps + Send + Sync>(
     stream: TcpStream,
     receivers: Arc<Vec<crossbeam_channel::Receiver<Bytes>>>,
-    px4_device: Arc<std::sync::Mutex<Px4Device<'static, B>>>,
+    px4_device: Arc<std::sync::Mutex<Px4Device<B>>>,
 ) {
     tracing::info!("[client] Connected.");
 
@@ -292,7 +292,7 @@ pub fn handle_client<B: BusOps + Send + Sync>(
 
                                         // ISDB-S かつ 「Tune前にStreamIDを設定する」タイプの場合
                                         if let Ok(true) = dev.is_set_stream_id_before_tune(port) {
-                                            let tsid = channel.sub_channel.unwrap_or(0) as u16;
+                                            let tsid = channel.sub_channel.unwrap_or(0);
                                             if let Err(e) = dev.set_stream_id(port, tsid) {
                                                 tracing::warn!("[warn] TSID set failed: {:?}", e);
                                                 continue;
@@ -346,7 +346,7 @@ pub fn handle_client<B: BusOps + Send + Sync>(
 
                                         // ISDB-S かつ 「Tune後にStreamIDを設定する」タイプの場合
                                         if let Ok(true) = dev.is_set_stream_id_after_tune(port) {
-                                            let tsid = channel.sub_channel.unwrap_or(0) as u16;
+                                            let tsid = channel.sub_channel.unwrap_or(0);
                                             if let Err(e) = dev.set_stream_id(port, tsid) {
                                                 tracing::warn!("[warn] TSID set failed: {:?}", e);
                                                 continue;
@@ -382,8 +382,8 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                                     "Set LNB voltage: {}",
                                                     target_voltage
                                                 );
-                                                if let Err(e) = dev
-                                                    .set_lnb_voltage(port as usize, target_voltage)
+                                                if let Err(e) =
+                                                    dev.set_lnb_voltage(port, target_voltage)
                                                 {
                                                     send_error(
                                                         &mut io,
@@ -427,7 +427,7 @@ pub fn handle_client<B: BusOps + Send + Sync>(
 
                                                 // debug
                                                 sent_packets += 1;
-                                                if sent_packets % 1000 == 0 {
+                                                if sent_packets.is_multiple_of(1000) {
                                                     tracing::info!(
                                                         "stream sent_packets = {} queue_len = {}",
                                                         sent_packets,
@@ -482,7 +482,7 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                             DaemonCommand::GetSignal { port } => {
                                 // 監視中(StartStream前)は、バッファが溢れないように溜まったTSパケットを全破棄する
                                 if let Some(rx) = receivers.get(port) {
-                                    while let Ok(_) = rx.try_recv() {}
+                                    while rx.try_recv().is_ok() {}
                                 }
 
                                 let mut dev = match px4_device.lock() {
@@ -543,7 +543,7 @@ pub fn handle_client<B: BusOps + Send + Sync>(
 pub fn run_server<B: BusOps + Send + Sync>(
     listener: TcpListener,
     receivers: Arc<Vec<crossbeam_channel::Receiver<Bytes>>>,
-    px4_device: Arc<std::sync::Mutex<Px4Device<'static, B>>>,
+    px4_device: Arc<std::sync::Mutex<Px4Device<B>>>,
 ) -> DaemonResult<()> {
     tracing::info!(
         "[server] Daemon started. Waiting for connections on {}...",

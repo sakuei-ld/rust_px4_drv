@@ -375,7 +375,7 @@ impl BusOps for UsbBusRusb {
                         //info!("read_bulk size={}", len);
 
                         // try_send を使い、PC側の処理が遅れても USB の読み取りは止めない
-                        if let Err(_) = raw_tx.try_send(data) {
+                        if raw_tx.try_send(data).is_err() {
                             //debug
                             internal_drop_producer.fetch_add(1, Ordering::Relaxed);
                             internal_drop += 1;

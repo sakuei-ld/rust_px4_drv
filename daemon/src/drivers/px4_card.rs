@@ -3,11 +3,14 @@
 //! IT930xデバイスを介してスマートカード（B-CASカード等）と通信するための抽象化レイヤー。
 //! Cコードの ifdhandler.c (px4_drv) の T=1 プロトコル実装に準拠。
 
+use ::tracing::warn;
+use thiserror::Error;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use crate::drivers::it930x::{CtrlMsgError, GpioMode, IT930x};
 use crate::drivers::itedtv_bus::BusOps;
-use ::tracing::warn;
-use std::time::{Duration, Instant};
-use thiserror::Error;
 
 // B-CASカード固有コマンド
 pub const BCAS_CMD_INITIALIZE: u8 = 0x90; // Initialize (get card info)
@@ -30,12 +33,6 @@ pub const BCAS_INFO_RESP_SIZE: usize = 17;
 pub const BCAS_CMD_TIMEOUT_MS: u64 = 2000;
 pub const BCAS_READ_CH_TIMEOUT_MS: u64 = 1000;
 
-// スマートカード関連定数
-const SC_RESET_ON: u8 = 1;
-const SC_RESET_OFF: u8 = 0;
-const SC_ENABLE_POWER: u8 = 1;
-const SC_DISABLE_POWER: u8 = 0;
-
 // T=1プロトコル定数 (ISO/IEC 7816-3準拠)
 const T1_NAD_IFD_ICC: u8 = 0x00; // NAD: IFD=0, ICC=0
 const T1_PCB_I_BLOCK: u8 = 0x00; // I-block (bit7=0)
@@ -52,10 +49,8 @@ const T1_IFS_IFSD: u8 = 254; // IFD max INF size to advertise to card
 
 const DEFAULT_T1_IFSC: u8 = 32;
 const MAX_ATR_LENGTH: usize = 33;
-const MAX_BLOCK_SIZE: usize = 254; // T=1 max INF size
 const T1_RX_TIMEOUT_MS: u64 = 200;
 const T1_RX_POLL_MS: u64 = 10;
-const T1_GUARD_INTERVAL_US: u64 = 0;
 const RX_ZERO_LENGTH_RETRY_MAX: u8 = 3;
 
 const T1_GUARD_INTERVAL_MS: u64 = 10;
@@ -179,9 +174,8 @@ impl Default for T1State {
 /// B-CASカード用スマートカードIFD実装
 ///
 /// IT930xデバイスを介してB-CASカードと通信します。
-pub struct BcasCard<'a, B: BusOps> {
-    it930x: &'a IT930x<B>,
-    card_present: bool,
+pub struct BcasCard<B: BusOps> {
+    it930x: Arc<IT930x<B>>,
     current_protocol: Protocol,
     /// T=1プロトコル状態
     t1: T1State,
@@ -191,11 +185,10 @@ pub struct BcasCard<'a, B: BusOps> {
     last_io_time: Option<Instant>,
 }
 
-impl<'a, B: BusOps> BcasCard<'a, B> {
-    pub fn new(it930x: &'a IT930x<B>) -> Self {
+impl<B: BusOps> BcasCard<B> {
+    pub fn new(it930x: Arc<IT930x<B>>) -> Self {
         Self {
             it930x,
-            card_present: false,
             current_protocol: Protocol::None,
             t1: T1State::default(),
             atr: Vec::new(),
@@ -258,13 +251,6 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
         total_needed
     }
 
-    /// カードの検出状態を更新する
-    fn update_detection(&mut self) -> Result<bool, SmartCardError> {
-        let detected = self.it930x.bcas_detect_card()?;
-        self.card_present = detected;
-        Ok(detected)
-    }
-
     /// カードを検出する（SmartCardInterface traitのためpublic）
     pub fn detect(&self) -> Result<bool, SmartCardError> {
         self.it930x
@@ -282,226 +268,6 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
         self.current_protocol = Protocol::T1;
         Ok(())
     }
-
-    /// カードをリセットし、ATRを取得して保存する（SmartCardInterface trait実装）
-    /// 親クラスの `reset()` を呼び出してATRを取得し、`self.atr` に保存する。
-
-    /// T=1プロトコルに基づくブロックを送信する
-    fn send_t1_block(&mut self, block: &[u8]) -> Result<(), SmartCardError> {
-        // フレーム送信の直前で wait_guard_interval() を呼び出し、送信後に update_io_time() を呼ぶ
-        self.wait_guard_interval();
-
-        // ブロックデータをそのままUARTで送信
-        self.it930x
-            .bcas_send_data(block)
-            .map_err(SmartCardError::Control)?;
-
-        self.update_io_time();
-
-        Ok(())
-    }
-
-    /// T=1プロトコルに基づくブロックを受信する
-    fn recv_t1_block(&mut self, buf: &mut [u8]) -> Result<usize, SmartCardError> {
-        // レディ状態を待つ（タイムアウト付き）
-        let timeout = std::time::Duration::from_millis(100);
-        let start = std::time::Instant::now();
-
-        while start.elapsed() < timeout {
-            if self.it930x.bcas_check_ready()? {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-
-        // データを受信
-        let len = self
-            .it930x
-            .bcas_get_data(buf)
-            .map_err(SmartCardError::Control)?;
-
-        if len == 0 {
-            return Err(SmartCardError::Timeout);
-        }
-
-        Ok(len)
-    }
-
-    /// T=1 I-blockを送信する
-    fn send_t1_i_block(&mut self, seq: u8, data: &[u8]) -> Result<(), SmartCardError> {
-        let mut block = Vec::with_capacity(3 + data.len());
-
-        // INS byte (T=1 Information Block)
-        block.push(0x60 | (seq << 4));
-
-        // L.C (Length)
-        if data.len() < 256 {
-            block.push(data.len() as u8);
-        } else {
-            return Err(SmartCardError::Protocol("Data too long".to_string()));
-        }
-
-        // Data
-        block.extend_from_slice(data);
-
-        // CRCはIT930xハードウェアが処理する可能性あり
-        // 必要に応じて実装
-
-        self.send_t1_block(&block)?;
-        Ok(())
-    }
-
-    /// T=1 R-block（レスポンス要求）を送信する
-    fn send_t1_r_block(&mut self, seq: u8) -> Result<(), SmartCardError> {
-        let block = [0xA0 | (seq << 4)];
-        self.send_t1_block(&block)?;
-        Ok(())
-    }
-
-    /// T=1 S-block（インターブロック制御）を送信する
-    fn send_t1_s_block(&mut self, func: u8, block_num: u8) -> Result<(), SmartCardError> {
-        let block = [0xC0 | (func << 4) | block_num];
-        self.send_t1_block(&block)?;
-        Ok(())
-    }
-
-    /// ATR解析 (ISO/IEC 7816-3準拠)
-    ///
-    /// TS, TA1, TB1, TC1, TD1, ... とインターフェースバイトを辿り、
-    /// T=1用のパラメータ（IFSC、EDC種別）を抽出する。
-    /*
-    fn parse_atr(atr: &[u8]) -> Result<CardInfo, SmartCardError> {
-        if atr.is_empty() {
-            return Err(SmartCardError::InvalidAtr);
-        }
-
-        let ts = atr[0];
-        // TS: 標準的には 0x3B (direct) または 0x3F (inverse)
-        if ts != 0x3B && ts != 0x3F {
-            return Err(SmartCardError::InvalidAtr);
-        }
-
-        let t0 = if atr.len() > 1 { atr[1] } else { 0 };
-
-        // T0ビット解析: TA/TB/TC count are per TD chain, not just initial T0
-        let _ta_count_init = ((t0 & 0xF0) >> 4) as usize; // Initial TAx count
-        let _tb_count_init = ((t0 & 0x0F) >> 0) as usize; // Initial TBx count
-        let _protocol_t = (t0 & 0x10) >> 4; // Tバイト (16=T=1, 0=T=0)
-
-        // プロトコル判定（最初のTバイト）
-        let mut current_protocol = if t0 & 0x10 != 0 {
-            Protocol::T1
-        } else if t0 & 0x01 != 0 {
-            Protocol::T0
-        } else {
-            Protocol::None
-        };
-
-        // インターフェースバイトを順に辿る (ISO/IEC 7816-3準拠)
-        // 位置: TS(0) T0(1) TA1(..) TB1(..) TC1(..) TD1(..) TA2(..) ...
-        let mut idx = 2; // T0の次から開始
-
-        // IFSCとEDC種別（T=1用）
-        let mut ifsc: Option<u8> = None;
-        let mut edc_crc = false; // デフォルトLRC
-
-        // TDバイトがない場合はTA/TB/TCは指定されない
-        // 正しい実装: TD0 があれば TA1/TB1/TC1/TD2 ... の順で続く
-        if atr.len() > 2 {
-            let has_interface = (t0 & 0x0F) != 0 || ((t0 >> 4) & 0x0F) != 0;
-
-            if has_interface && idx < atr.len() {
-                // TD0 at idx=2
-                let td0 = atr[idx];
-                idx += 1;
-
-                // TA1 exists if bit4 of T0 is set
-                for _ in 0..((t0 >> 4) & 0x0F) {
-                    if idx < atr.len() {
-                        idx += 1; // Skip TA bytes
-                    }
-                }
-
-                // TB1 exists if bit0 of T0 is set
-                for _ in 0..(t0 & 0x0F) {
-                    if idx < atr.len() {
-                        idx += 1; // Skip TB bytes
-                    }
-                }
-
-                // TC1 exists if bit1 of T0 is set
-                for _ in 0..((t0 >> 1) & 0x0F) {
-                    if idx < atr.len() {
-                        idx += 1; // Skip TC bytes (EDC type per TD chain, not here)
-                    }
-                }
-
-                // TD1 at idx (if TD0 bit 4 = 1, meaning T=1 is selected)
-                if td0 & 0x10 != 0 {
-                    // T=1 selected
-                    current_protocol = Protocol::T1;
-
-                    // Check for more interface bytes (TD1)
-                    if idx < atr.len() && (td0 & 0x0F) != 0 {
-                        let td1 = atr[idx];
-                        idx += 1;
-
-                        // TA2 exists if bit4 of TD0 is set
-                        if (td0 >> 4) & 0x01 != 0 {
-                            if idx < atr.len() {
-                                idx += 1; // TA2
-                            }
-                        }
-
-                        // TB2 exists if bit0 of TD0 is set
-                        if td0 & 0x01 != 0 {
-                            if idx < atr.len() {
-                                idx += 1; // TB2
-                            }
-                        }
-
-                        // TC2 exists if bit1 of TD0 is set
-                        if (td0 >> 1) & 0x01 != 0 {
-                            if idx < atr.len() {
-                                idx += 1; // TC2
-                            }
-                        }
-
-                        // TD2 - check for T=1 continuation with more interface bytes
-                        if (td1 & 0x10) != 0 && idx < atr.len() && (td1 & 0x0F) != 0 {
-                            // TA3 exists if bit4 of TD1 is set
-                            if (td1 >> 4) & 0x01 != 0 {
-                                if idx < atr.len() {
-                                    // TA3 contains IFSC in bits 0-3
-                                    ifsc = Some(atr[idx] & 0x0F);
-                                    idx += 1;
-                                }
-                            }
-
-                            // TC3 exists if bit1 of TD1 is set — EDC type
-                            if (td1 >> 1) & 0x01 != 0 {
-                                if idx < atr.len() {
-                                    let tc3 = atr[idx];
-                                    edc_crc = (tc3 & 0x01) != 0; // bit0: 1=CRC, 0=LRC
-                                    idx += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(CardInfo {
-            atr: atr.to_vec(),
-            ts,
-            t0,
-            protocol: current_protocol,
-            ifsc,
-            edc_crc,
-        })
-    }
-    */
 
     /// ATR (Answer To Reset) のパース処理
     pub fn parse_atr(atr: &[u8]) -> Result<CardInfo, SmartCardError> {
@@ -590,7 +356,7 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
     }
 }
 
-impl<'a, B: BusOps> SmartCardInterface for BcasCard<'a, B> {
+impl<B: BusOps> SmartCardInterface for BcasCard<B> {
     /// カードのリセットを実行
     fn reset(&mut self) -> Result<CardInfo, SmartCardError> {
         // UARTをスマートカードモードに切り替える(従来 initialize() 経由でしか呼ばれていなかった)
@@ -631,7 +397,7 @@ impl<'a, B: BusOps> SmartCardInterface for BcasCard<'a, B> {
             offset += len;
 
             // ATRが完全に受信されたか判定（簡易実装）
-            if offset >= 3 && offset < MAX_ATR_LENGTH {
+            if (3..MAX_ATR_LENGTH).contains(&offset) {
                 // カード依存だが、一定サイズ以上取得できたら完了とみなす
                 break;
             }
@@ -687,12 +453,12 @@ impl<'a, B: BusOps> SmartCardInterface for BcasCard<'a, B> {
         self.it930x.set_gpio_mode(14, GpioMode::Out, true)?;
         self.it930x
             .write_gpio(14, reset)
-            .map_err(|e| SmartCardError::Control(e))?;
+            .map_err(SmartCardError::Control)?;
         Ok(())
     }
 }
 
-impl<'a, B: BusOps> BcasCard<'a, B> {
+impl<B: BusOps> BcasCard<B> {
     // ---- Generic APDU transparent relay API ----
 
     /// 任意のAPDUバイト列をカードへ送信し、応答をそのまま返す。
@@ -710,8 +476,8 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
     /// # 将来的な拡張について
     /// TODO: 256バイトを超えるAPDU（Case 4でLe=256等）や、複数チャンクへの分割送信に対応する場合は、
     /// `transceive_t1` のバッファ管理を動的サイズ対応へ変更する必要がある。
-    // ---- B-CAS specific commands (BonCasServer style) ----
-
+    /// ---- B-CAS specific commands (BonCasServer style) ----
+    ///
     /// B-CASカードを初期化する (Initialize command: 90 30 00 00 00)
     ///
     /// これは `transceive_raw()` を使った固定APDU送信の一例である。
@@ -884,7 +650,11 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             let recv_len = self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)?;
 
             // debug
-            tracing::debug!("[bcas] t1_init RESYNCH resp ({} bytes): {:02X?}", recv_len, &resp[..recv_len]);
+            tracing::debug!(
+                "[bcas] t1_init RESYNCH resp ({} bytes): {:02X?}",
+                recv_len,
+                &resp[..recv_len]
+            );
 
             if recv_len == 0 {
                 continue;
@@ -925,7 +695,11 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
             let recv_len = self.t1_wait_response(&mut resp, T1_RX_TIMEOUT_MS)?;
 
             //debug
-            tracing::debug!("[bcas] t1_init IFS resp ({} bytes): {:02X?}", recv_len, &resp[..recv_len.min(resp.len())]);
+            tracing::debug!(
+                "[bcas] t1_init IFS resp ({} bytes): {:02X?}",
+                recv_len,
+                &resp[..recv_len.min(resp.len())]
+            );
 
             if recv_len == 0 {
                 continue;
@@ -1293,7 +1067,10 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
                 // 0 に落としても良いかも
                 // debug
                 if poll_count > 5 {
-                    warn!("t1_wait_response: {} polls before timeout/response", poll_count);
+                    warn!(
+                        "t1_wait_response: {} polls before timeout/response",
+                        poll_count
+                    );
                 }
 
                 return Ok(total);
@@ -1339,22 +1116,20 @@ impl<'a, B: BusOps> BcasCard<'a, B> {
         // UART ボーレート設定 (9600bps)
         self.it930x
             .set_uart_baudrate(crate::drivers::it930x::UartBaudrate::Baudrate9600)
-            .map_err(|e| SmartCardError::Control(e))?;
+            .map_err(SmartCardError::Control)?;
 
         // UART モード切替 (BCASカード通信モード)
-        self.it930x
-            .bcas_init()
-            .map_err(|e| SmartCardError::Control(e))?;
+        self.it930x.bcas_init().map_err(SmartCardError::Control)?;
 
         // GPIO H14 を出力モードに設定（リセット制御用）
         self.it930x
             .set_gpio_mode(14, crate::drivers::it930x::GpioMode::Out, true)
-            .map_err(|e| SmartCardError::Control(e))?;
+            .map_err(SmartCardError::Control)?;
 
         // GPIO H6 を入力モードに設定（カード検出用）
         self.it930x
             .set_gpio_mode(6, crate::drivers::it930x::GpioMode::In, true)
-            .map_err(|e| SmartCardError::Control(e))?;
+            .map_err(SmartCardError::Control)?;
 
         Ok(())
     }
