@@ -7,6 +7,33 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use crate::drivers::itedtv_bus::{BusError, BusOps};
+use std::time::{Duration, Instant};
+
+/// ctrl_lock の保持時間を RAII で測定し、閾値以上なら warn で記録する。
+/// Drop 時にトリガーされるため、ctrl_msg 内の早期 return / パニックのいずれでも必ず記録される。
+struct CtrlLockTimer {
+    start: Instant,
+}
+
+impl CtrlLockTimer {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for CtrlLockTimer {
+    fn drop(&mut self) {
+        let held = self.start.elapsed();
+        if held >= Duration::from_millis(100) {
+            tracing::warn!(
+                "[CTRL] ctrl_lock held {}ms (>=100ms threshold)",
+                held.as_millis()
+            );
+        }
+    }
+}
 
 // これに関しては、いろんなところで使うので、実際はここじゃない方が良いかもしれない。
 // 下記2つで i2c_comm.h 17 〜 26 の移植
@@ -105,7 +132,9 @@ fn dump_hex(label: &str, data: &[u8]) {
 impl<B: BusOps> IT930x<B> {
     // it930x.c 78〜176 の移植 ... おそらく Mutex が要るので、あとで調査する。
     pub fn ctrl_msg(&self, cmd: u16, wdata: &[u8], rdata: &mut [u8]) -> Result<(), CtrlMsgError> {
-        // Mutex
+        // Mutex + 保持時間計測 (Drop 時に >=100ms なら warn)。
+        // 注: Timer 自身が lock を保有するため、スコープ終了時に一緒に解放される。
+        let _lock_timer = CtrlLockTimer::new();
         let _lock = self.ctrl_lock.lock().unwrap();
 
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);

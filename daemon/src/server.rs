@@ -416,9 +416,12 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                 send_ok(&mut io);
 
                                 if let Some(rx) = receivers.get(port) {
+                                    let mut last_data_time = std::time::Instant::now();
+
                                     loop {
                                         match rx.recv_timeout(Duration::from_millis(500)) {
                                             Ok(packet) => {
+                                                last_data_time = std::time::Instant::now();
                                                 if io.send_ts(&packet).is_err() {
                                                     let _ = io.writer.flush();
                                                     tracing::info!("[client] stream closed.");
@@ -442,6 +445,18 @@ pub fn handle_client<B: BusOps + Send + Sync>(
                                                     tracing::error!("Flush error: {}", e);
                                                     break;
                                                 }
+
+                                                // 5秒以上連続無データなら STREAM_READ_TIMEOUT warn。
+                                                // producer 死([PROD] EXIT 出現)か、データ自体が止まったのか区別できる。
+                                                if last_data_time.elapsed() >= Duration::from_millis(TIMEOUT_MS as u64) {
+                                                    tracing::warn!(
+                                                        "STREAM_READ_TIMEOUT: no data for {}ms port={} sent_packets={}",
+                                                        last_data_time.elapsed().as_millis(),
+                                                        port,
+                                                        sent_packets
+                                                    );
+                                                }
+
                                                 continue;
                                             }
 

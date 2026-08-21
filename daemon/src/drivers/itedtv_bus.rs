@@ -291,6 +291,18 @@ impl BusOps for UsbBusRusb {
 
             // raw_rx にデータが届く限り、ひたすらハンドラを回す
             while let Ok(data) = raw_rx.recv() {
+                // ハートビート (>=5s ごとに 1 行 warn)。consumer がデータを受け取り処理しているか確認。
+                if last_log.elapsed() >= std::time::Duration::from_secs(5) {
+                    warn!(
+                        "[CONS] alive pkts={} bytes={} total_pkts={} total_bytes={}",
+                        packet_count_consumer.load(Ordering::Relaxed),
+                        byte_count_consumer.load(Ordering::Relaxed),
+                        total_packet_count_consumer.load(Ordering::Relaxed),
+                        total_byte_count_consumer.load(Ordering::Relaxed)
+                    );
+                    last_log = std::time::Instant::now();
+                }
+
                 // debug
                 packet_count_consumer.fetch_add(1, Ordering::Relaxed);
                 byte_count_consumer.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -365,8 +377,23 @@ impl BusOps for UsbBusRusb {
             let mut usb_bytes = 0u64;
             let mut internal_drop = 0u64;
 
+            // 定期ハートビート: producer が生存(USB読取ループ継続中)か 5 秒ごとに確認する
+            let mut hb_start = std::time::Instant::now();
+
             while !stop_flag_thread.load(Ordering::Acquire) {
                 let result = handle_arc.read_bulk(ep, &mut buf, Duration::from_millis(100));
+
+                // ハートビート (>=5s ごとに 1 行 warn)。read_bulk が 100ms 単位で回るので、
+                // 5s ごとに必ず 1 回 emit される。もし producer が死んでいれば、この行が消える。
+                if hb_start.elapsed() >= std::time::Duration::from_secs(5) {
+                    warn!(
+                        "[PROD] alive ep=0x{:02x} bytes={} drops={}",
+                        ep,
+                        usb_bytes,
+                        internal_drop
+                    );
+                    hb_start = std::time::Instant::now();
+                }
 
                 match result {
                     Ok(len) => {
@@ -394,6 +421,15 @@ impl BusOps for UsbBusRusb {
                             ep,
                             e,
                             buf.len()
+                        );
+                        // producer が死んだことを明示 (handle の競合 or 真のエラー)。
+                        // ここに到達した後は [PROD] alive ハートビートも止まる。
+                        error!(
+                            "[PROD] EXIT ep=0x{:02x} reason=read_bulk_err={:?} bytes_total={} drops={}",
+                            ep,
+                            e,
+                            usb_bytes,
+                            internal_drop
                         );
                         break;
                     }
