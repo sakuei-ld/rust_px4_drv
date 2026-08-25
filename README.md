@@ -29,15 +29,15 @@ rust-px4-drv-shim: 上記 daemon の簡易クライアント
   引数は下記
   - host  
   受ける ip アドレス。  
-  default は 127.0.0.1 (ローカル限定)
+  default は 127.0.0.1 (ローカル限定)  
   0.0.0.0 を設定することで、ネットワークからのアクセスを許諾 (コンテナからのアクセスとか)
-  - port
-  受ける port 番号。
+  - port  
+  受ける port 番号。  
   default は 40771 (mirakc が 40772 だった気がするので)
-  - enable-bcas
+  - enable-bcas  
   B-CAS の Proxy の有効化
-  - bcas-proxy-port
-  B-CAS の Proxy サーバーのポート番号
+  - bcas-proxy-port  
+  B-CAS の Proxy サーバーのポート番号  
   default は 6900
 - rust-px4-drv-shim  
 コマンドは2種
@@ -61,7 +61,7 @@ rust-px4-drv-shim: 上記 daemon の簡易クライアント
   標準出力は -
   - host  
   接続先 ipアドレス  
-  - port
+  - port  
   daemon の port番号
 
 ## ToDo
@@ -74,5 +74,5 @@ rust-px4-drv-shim: 上記 daemon の簡易クライアント
 - px4_drv  
 - recisdb-rs  
 
-Gemini(無料版)、ChatGPT(無料版) および Claude(無料版) を使い倒しました。
+Gemini(無料版)、ChatGPT(無料版) および Claude(無料版) を使い倒しました。  
 また、LocalLLM として、Qwen3.6 35B A3B および Qwen3.8 27B を試しています。
