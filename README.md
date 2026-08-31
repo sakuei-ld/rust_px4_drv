@@ -71,8 +71,10 @@ rust-px4-drv-shim: 上記 daemon の簡易クライアント
 
 ## その他
 このアプリケーションは、下記を参考に実装しています。  
-- px4_drv  
-- recisdb-rs  
+- px4_drv(nns779/px4_drv および tsukumijima/px4_drv)  
+- px4_drv(yyya-nico/px4_drv ... ICカードリーダー)  
+- recisdb-rs(kazuki0824/recisdb-rs)  
+- bcs-perl(walkure/bcs-perl)  
 
 Gemini(無料版)、ChatGPT(無料版) および Claude(無料版) を使い倒しました。  
 また、LocalLLM として、Qwen3.6 35B A3B および Qwen3.8 27B を試しています。
